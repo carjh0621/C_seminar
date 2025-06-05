@@ -1,8 +1,9 @@
 {# agenda.md.j2 #}
-{% macro task_display(task, today, TaskStatus) -%}
-    {% set time_str = task.due_dt.strftime('%H:%M') if task.due_dt and task.due_dt.time() != time(0,0) else '' %}
-    {% set d_day_diff = (task.due_dt.date() - today).days if task.due_dt else None %}
+{% macro task_display(task, today, TaskStatus) -%} {# TaskStatus and time object are passed from context via writer #}
+    {# Only display time if it's not midnight (00:00:00) #}
+    {% set time_str = task.due_dt.strftime('%H:%M') if task.due_dt and task.due_dt.time() != time(0,0,0) else '' %}
 
+    {% set d_day_diff = (task.due_dt.date() - today).days if task.due_dt else None %}
     {% set d_day_str = '' %}
     {% if d_day_diff is not none %}
         {% if d_day_diff == 0 %}
@@ -14,29 +15,60 @@
         {% endif %}
     {% endif %}
 
-    {% set task_type_tag = '#' ~ task.type if task.type else '#task' %} {# Default tag if type is not specified #}
     {% set task_title = task.title | default('Untitled Task') %}
 
+    {# --- Tag processing --- #}
+    {% set final_tags_list = [] %}
+    {# Add task.type as a primary tag #}
+    {% if task.type and task.type.strip() %}
+        {% do final_tags_list.append('#' ~ task.type.strip()) %}
+    {% else %}
+        {% do final_tags_list.append('#task') %} {# Default tag if type is not specified or empty #}
+    {% endif %}
+
+    {# Add tags from task.tags field #}
+    {% if task.tags and task.tags.strip() %} {# Check if task.tags exists and is not just whitespace #}
+        {% for tag_item in task.tags.split(',') %}
+            {% set cleaned_tag = tag_item.strip() %}
+            {% if cleaned_tag %} {# Ensure tag is not empty after stripping #}
+                {% if not cleaned_tag.startswith('#') %}
+                    {% set tag_to_add = '#' ~ cleaned_tag %}
+                {% else %}
+                    {% set tag_to_add = cleaned_tag %}
+                {% endif %}
+                {# Avoid duplicating tags if already present (e.g. from task.type) #}
+                {% if tag_to_add not in final_tags_list %}
+                    {% do final_tags_list.append(tag_to_add) %}
+                {% endif %}
+            {% endif %}
+        {% endfor %}
+    {% endif %}
+    {% set tags_display_string = final_tags_list | join(' ') %}
+    {# --- End Tag processing --- #}
+
 {% if task.status == TaskStatus.DONE -%}
-- ~~[x] {% if time_str %}{{ time_str }} {% endif %}{{ task_title }}~~ {{ d_day_str }} {{ task_type_tag }}
+- ~~[x] {% if time_str %}{{ time_str }} {% endif %}{{ task_title }}~~ {{ d_day_str }} {{ tags_display_string }}
 {% elif task.status == TaskStatus.CANCELLED -%}
-- ~~[ ] {{ task_title }}~~ {{ d_day_str }} {{ task_type_tag }} (Cancelled)
+- ~~[c] {{ task_title }}~~ {{ d_day_str }} {{ tags_display_string }} (Cancelled) {# Changed from [ ] to [c] for cancelled #}
 {% else -%}
-- [ ] {% if time_str %}{{ time_str }} {% endif %}{{ task_title }} {{ d_day_str }} {{ task_type_tag }}
+- [ ] {% if time_str %}{{ time_str }} {% endif %}{{ task_title }} {{ d_day_str }} {{ tags_display_string }}
 {% endif -%}
 {%- endmacro %}
 
-{# Expects tasks_by_date: dict where keys are date objects and values are lists of task objects #}
-{# Expects today: a date object for D-day calculation #}
-{# Expects TaskStatus: The TaskStatus enum itself for comparison #}
-{# Expects time: The time function from datetime for checking 00:00 time #}
+{# Main template structure #}
+{# Expects:
+    tasks_by_date: dict {date: [task_obj, ...]}
+    today: date object for D-day calculation
+    TaskStatus: Enum object (e.g., persistence.models.TaskStatus) provided in context
+    time: datetime.time constructor/object provided in context (for time(0,0,0) comparison)
+#}
 
-{% set sorted_dates = tasks_by_date.keys() | sort %} {# Sort dates chronologically (e.g., past to future) #}
+{% set sorted_dates = tasks_by_date.keys() | sort %} {# Sort dates chronologically #}
 
 {% for current_date in sorted_dates %}
 ## {{ current_date.strftime('%Y-%m-%d') }} ({{ ["월", "화", "수", "목", "금", "토", "일"][current_date.weekday()] }})
 {% for task in tasks_by_date[current_date] | sort(attribute='due_dt') %}
-{{ task_display(task, today, TaskStatus) }}
+{{ task_display(task, today, TaskStatus) }} {# Pass TaskStatus to the macro #}
 {% endfor %}
 ---
 {% endfor %}
