@@ -1,0 +1,42 @@
+{# agenda.md.j2 #}
+{% macro task_display(task, today, TaskStatus) -%}
+    {% set time_str = task.due_dt.strftime('%H:%M') if task.due_dt and task.due_dt.time() != time(0,0) else '' %}
+    {% set d_day_diff = (task.due_dt.date() - today).days if task.due_dt else None %}
+
+    {% set d_day_str = '' %}
+    {% if d_day_diff is not none %}
+        {% if d_day_diff == 0 %}
+            {% set d_day_str = '(D-Day)' %}
+        {% elif d_day_diff > 0 %}
+            {% set d_day_str = '(D-' ~ d_day_diff ~ ' 남음)' %} {# Remaining #}
+        {% else %}
+            {% set d_day_str = '(D+' ~ (d_day_diff * -1) ~ ' 지남)' %} {# Passed #}
+        {% endif %}
+    {% endif %}
+
+    {% set task_type_tag = '#' ~ task.type if task.type else '#task' %} {# Default tag if type is not specified #}
+    {% set task_title = task.title | default('Untitled Task') %}
+
+{% if task.status == TaskStatus.DONE -%}
+- ~~[x] {% if time_str %}{{ time_str }} {% endif %}{{ task_title }}~~ {{ d_day_str }} {{ task_type_tag }}
+{% elif task.status == TaskStatus.CANCELLED -%}
+- ~~[ ] {{ task_title }}~~ {{ d_day_str }} {{ task_type_tag }} (Cancelled)
+{% else -%}
+- [ ] {% if time_str %}{{ time_str }} {% endif %}{{ task_title }} {{ d_day_str }} {{ task_type_tag }}
+{% endif -%}
+{%- endmacro %}
+
+{# Expects tasks_by_date: dict where keys are date objects and values are lists of task objects #}
+{# Expects today: a date object for D-day calculation #}
+{# Expects TaskStatus: The TaskStatus enum itself for comparison #}
+{# Expects time: The time function from datetime for checking 00:00 time #}
+
+{% set sorted_dates = tasks_by_date.keys() | sort %} {# Sort dates chronologically (e.g., past to future) #}
+
+{% for current_date in sorted_dates %}
+## {{ current_date.strftime('%Y-%m-%d') }} ({{ ["월", "화", "수", "목", "금", "토", "일"][current_date.weekday()] }})
+{% for task in tasks_by_date[current_date] | sort(attribute='due_dt') %}
+{{ task_display(task, today, TaskStatus) }}
+{% endfor %}
+---
+{% endfor %}

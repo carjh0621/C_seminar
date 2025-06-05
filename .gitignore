@@ -338,3 +338,24 @@ ASALocalRun/
 
 # BeatPulse healthcheck temp database
 healthchecksdb
+
+# Python common ignores
+*$py.class
+*.egg-info/
+.env
+.venv/
+venv/
+env/
+pip-wheel-metadata/
+.installed.cfg
+*.egg
+
+# OAuth credential files (Sensitive - DO NOT COMMIT)
+credentials.json
+token.json
+*.token.json
+
+# Test outputs
+test_agenda_output.md
+dummy_credentials_for_test.json
+dummy_token_for_test.json
