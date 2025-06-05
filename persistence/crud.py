@@ -227,3 +227,60 @@ def delete_token(db: Session, user_identifier: str, platform: str) -> bool:
 # cause errors at runtime. The model should be updated accordingly.
 # The user_id field in SourceToken is assumed to be of a type compatible with user_identifier.
 # If user_id is strictly an Integer, user_identifier might need to be an int or castable to int.
+
+
+# --- Task CRUD Operations Additions ---
+
+def get_task_by_fingerprint(db: Session, fingerprint: str) -> models.Task | None:
+    """
+    Retrieves a task by its unique fingerprint.
+    Returns the Task object or None if not found.
+    """
+    if not fingerprint: # Cannot search for a None or empty fingerprint
+        return None
+    return db.query(models.Task).filter(models.Task.fingerprint == fingerprint).first()
+
+def get_tasks_on_same_day_with_time(db: Session, target_date: date, exclude_task_id: int | None = None) -> list[models.Task]:
+    """
+    Retrieves tasks on a specific date that have a specific time component (not midnight 00:00:00).
+    Optionally excludes a specific task by its ID.
+    """
+    query = db.query(models.Task).filter(
+        cast(models.Task.due_dt, SQLDate) == target_date, # Check for the same date part
+        cast(models.Task.due_dt, SQLTime) != time(0, 0, 0) # Ensure time is not midnight
+    )
+    if exclude_task_id is not None:
+        query = query.filter(models.Task.id != exclude_task_id)
+
+    # Also filter out tasks that are already CANCELLED or DONE, as they typically don't conflict.
+    query = query.filter(
+        models.Task.status != TaskStatus.CANCELLED,
+        models.Task.status != TaskStatus.DONE
+    )
+    return query.order_by(models.Task.due_dt).all()
+
+def update_task_tags(db: Session, task_id: int, new_tag: str) -> models.Task | None:
+    """
+    Adds a new tag to a task's tags field if not already present.
+    Assumes tags is a comma-separated string.
+    """
+    task = db.query(models.Task).filter(models.Task.id == task_id).first()
+    if task:
+        current_tags_str = task.tags or ""
+        # Split by comma, strip whitespace from each tag, filter out empty strings
+        current_tags_set = set(tag.strip() for tag in current_tags_str.split(',') if tag.strip())
+
+        if new_tag not in current_tags_set:
+            current_tags_set.add(new_tag)
+            # Store sorted for consistency and easier reading/parsing
+            task.tags = ",".join(sorted(list(current_tags_set)))
+            try:
+                db.commit()
+                db.refresh(task)
+            except Exception as e:
+                db.rollback()
+                print(f"Error updating tags for task {task_id}: {e}")
+                # Potentially re-raise or return None to indicate failure
+                return None
+        return task # Return task (possibly updated, or unchanged if tag was already present)
+    return None # Task not found

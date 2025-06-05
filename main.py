@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta, time as dt_time # For timedelta and time object comparison
 import sys
 import time # For keeping the main thread alive if using BackgroundScheduler (not used here yet)
 
@@ -12,6 +12,7 @@ from apscheduler.triggers.cron import CronTrigger
 from ingestion.agents import GmailAgent
 from preprocessing.normalizer import normalize as normalize_text # Alias to avoid name clash
 from extract_nlp.classifiers import TaskClassifier, resolve_date
+from extract_nlp.utils import generate_task_fingerprint # New import
 from openai import OpenAIError
 
 from persistence.database import SessionLocal, create_db_tables # For DB session and initial table creation
@@ -107,15 +108,82 @@ def run_gmail_ingestion_pipeline(app_user_id: str = "default_user"):
             "body": classification_result.get('body', normalized_content[:1000]),
             "due_dt": due_datetime, "created_dt": datetime.utcnow(),
             "status": TaskStatus.TODO,
+            # countdown_int is not set here, can be calculated later or by a DB trigger if needed
         }
+
+        # --- Generate Fingerprint (after title and due_dt are finalized) ---
+        task_title_from_llm = classification_result['title']
+        task_fingerprint = None
+        if task_title_from_llm:
+            try:
+                task_fingerprint = generate_task_fingerprint(task_title_from_llm, due_datetime)
+                print(f"Generated fingerprint: {task_fingerprint}")
+            except ValueError as ve:
+                print(f"Skipping fingerprint generation due to error: {ve}")
+            except Exception as e:
+                print(f"Unexpected error generating fingerprint for title '{task_title_from_llm}': {e}")
+
+        task_data_for_db["fingerprint"] = task_fingerprint
+        task_data_for_db["tags"] = None
+
+        # --- Deduplication Check ---
+        if task_fingerprint:
+            print(f"Checking for existing task with fingerprint: {task_fingerprint}...")
+            existing_task_by_fp = persistence_crud.get_task_by_fingerprint(db, task_fingerprint)
+            if existing_task_by_fp:
+                print(f"Duplicate task found by fingerprint (ID: {existing_task_by_fp.id}, Title: '{existing_task_by_fp.title}'). Skipping creation.")
+                continue
+            else:
+                print("No duplicate task found with this fingerprint.")
+        else:
+            print("No fingerprint generated for this task, cannot perform deduplication check based on it.")
+
+        newly_created_task_obj = None
         try:
-            print(f"Saving task '{task_data_for_db['title']}' to database...")
-            created_task = persistence_crud.create_task(db, task_data_for_db)
-            print(f"Task created successfully with ID: {created_task.id}")
+            print(f"Saving task '{task_data_for_db['title']}' to database (fingerprint: {task_fingerprint})...")
+            newly_created_task_obj = persistence_crud.create_task(db, task_data_for_db)
+            print(f"Task created successfully with ID: {newly_created_task_obj.id}, Fingerprint: {newly_created_task_obj.fingerprint}")
             tasks_created_count += 1
         except Exception as e:
             db.rollback()
             print(f"Error saving task (Source ID: {task_source_id}) to database: {e}")
+            continue # Skip conflict detection if task saving failed
+
+        # --- Conflict Detection and Tagging (NEW, after task is created) ---
+        if newly_created_task_obj and newly_created_task_obj.due_dt and \
+           newly_created_task_obj.due_dt.time() != dt_time(0, 0, 0): # Check if it has a specific time
+
+            print(f"Performing conflict check for task ID {newly_created_task_obj.id} (Due: {newly_created_task_obj.due_dt})...")
+            task_date = newly_created_task_obj.due_dt.date()
+
+            potential_conflicts = persistence_crud.get_tasks_on_same_day_with_time(
+                db, task_date, exclude_task_id=newly_created_task_obj.id
+            )
+
+            conflict_window = timedelta(hours=1) # Define conflict window (e.g., +/- 1 hour)
+
+            for existing_task in potential_conflicts:
+                # due_dt should be present due to query filter, but check defensively
+                if existing_task.due_dt:
+                    time_diff = abs(newly_created_task_obj.due_dt - existing_task.due_dt)
+                    if time_diff < conflict_window:
+                        print(f"Conflict detected between Task ID {newly_created_task_obj.id} (Due: {newly_created_task_obj.due_dt}) "
+                              f"and Task ID {existing_task.id} (Due: {existing_task.due_dt}).")
+
+                        print(f"Tagging Task ID {newly_created_task_obj.id} with #conflict.")
+                        updated_new_task = persistence_crud.update_task_tags(db, newly_created_task_obj.id, "#conflict")
+                        if updated_new_task:
+                            newly_created_task_obj = updated_new_task # Keep the refreshed object with new tags
+                        else:
+                            print(f"Warning: Failed to update tags for new task {newly_created_task_obj.id}")
+
+                        print(f"Tagging Task ID {existing_task.id} with #conflict.")
+                        persistence_crud.update_task_tags(db, existing_task.id, "#conflict")
+                        # No need to break, tag all conflicting tasks for completeness
+
+            # No explicit "no conflict found" message here to reduce verbosity,
+            # unless conflict_found_for_new_task flag was used and checked.
+            # The absence of conflict messages implies no conflicts.
     try:
         db.close()
         print("Database session closed.")

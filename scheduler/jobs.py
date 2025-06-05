@@ -1,91 +1,133 @@
 # scheduler/jobs.py
 import datetime
 import sys
-# Add project root to sys.path to allow imports from main, persistence etc.
-# This is often needed if scheduler is run as a separate process or script,
-# or if the main application structure doesn't automatically handle this.
-# Example:
-# import os
-# project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-# if project_root not in sys.path:
-#    sys.path.insert(0, project_root)
 
-_using_dummy_pipeline = False # Flag to indicate if the dummy function is in use
-
-# Attempt to import the pipeline function from main.py
+# --- Import Pipeline Function ---
+_using_dummy_pipeline = False # Flag to indicate if dummy pipeline is used
 try:
     from main import run_gmail_ingestion_pipeline
 except ImportError as e:
     print(f"Error importing 'run_gmail_ingestion_pipeline' from main: {e}")
-    print("Ensure the scheduler is run from a context where 'main.py' (project root) is discoverable,")
-    print("or adjust PYTHONPATH / sys.path in jobs.py or the runner script.")
+    print("Using DUMMY pipeline function for scheduler.jobs.")
+    _using_dummy_pipeline = True
+    def run_gmail_ingestion_pipeline(app_user_id="default_user"): # Dummy
+        print(f"DUMMY: run_gmail_ingestion_pipeline called for {app_user_id}")
+        if app_user_id == "simulate_pipeline_failure": # Specific user ID to test failure path
+            raise Exception("Simulated DUMMY pipeline failure")
+        print("DUMMY: Pipeline finished successfully.")
+        return True # Simulate success
+# --- End Pipeline Import ---
 
-    def run_gmail_ingestion_pipeline(app_user_id="default_user"): # Must match signature
-        print(f"DUMMY: run_gmail_ingestion_pipeline called for {app_user_id} because 'main.run_gmail_ingestion_pipeline' could not be imported.")
-        print("This is a placeholder. Actual pipeline did not run.")
-    globals()['_using_dummy_pipeline'] = True
+# --- Import Notifier ---
+_notifier_available = False # Flag to indicate if real notifier is available
+try:
+    from notifier.bots import TelegramNotifier
+    _notifier_available = True
+    print("Successfully imported TelegramNotifier.")
+except ImportError as e:
+    print(f"Error importing 'TelegramNotifier' from notifier.bots: {e}")
+    print("Telegram notifications will be disabled for this scheduler run (using DUMMY Notifier).")
+    class TelegramNotifier: # Dummy Notifier if import fails
+        def __init__(self, *args, **kwargs):
+            print("DUMMY TelegramNotifier initialized because real one failed to import or is misconfigured.")
+        def send_message(self, message_text: str) -> bool:
+            print(f"DUMMY TelegramNotifier: Would send message: '{message_text[:100]}...'. Returning True as placeholder.")
+            return True # Simulate success for testing flow
+# --- End Notifier Import ---
 
 
-def scheduled_job():
+def scheduled_job(simulate_failure_for_user: str = None):
     """
     The job function that will be executed by the scheduler.
-    This function calls the main Gmail ingestion pipeline.
+    Calls the main Gmail ingestion pipeline and sends a notification.
+    Args:
+        simulate_failure_for_user: If set to a user_id, and dummy pipeline is active,
+                                   will simulate a failure for that user.
     """
-    current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{current_time}] Scheduler job started: Running Gmail ingestion pipeline...")
+    current_time_start_obj = datetime.datetime.now()
+    current_time_start_str = current_time_start_obj.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{current_time_start_str}] Scheduler job started: Running Gmail ingestion pipeline...")
 
-    global _using_dummy_pipeline
+    pipeline_success = False
+    pipeline_error_message = None
+    job_end_time_str = current_time_start_str # Initialize with start time
 
     try:
-        target_user_id = "default_gmail_user"
-
-        # Check if the actual pipeline function is available
-        if 'run_gmail_ingestion_pipeline' not in globals() or \
-           (_using_dummy_pipeline and globals()['run_gmail_ingestion_pipeline'].__module__ == __name__):
-            # This condition means the import failed and we are using the dummy,
-            # or something is very wrong. The dummy function itself will print a message.
-            # If _using_dummy_pipeline is True, the dummy is already set.
-            # If it's False but function is still from this module, it means initial import failed
-            # but the flag wasn't set (should not happen with current logic).
-             if not _using_dummy_pipeline:
-                  print("CRITICAL: Real 'run_gmail_ingestion_pipeline' not imported and dummy not set correctly. Cannot run job.")
-                  # It's safer to return if the state is unexpected.
-                  return
+        # Define the user for whom the pipeline should run.
+        target_user_id = simulate_failure_for_user if simulate_failure_for_user and _using_dummy_pipeline else "default_gmail_user"
 
         run_gmail_ingestion_pipeline(app_user_id=target_user_id)
+        pipeline_success = True
+        job_end_time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        if not _using_dummy_pipeline:
-            current_time_finished = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{current_time_finished}] Scheduler job (actual pipeline) finished.")
+        if _using_dummy_pipeline:
+            print(f"[{job_end_time_str}] Scheduler job finished (using DUMMY Gmail pipeline).")
         else:
-            # Message for dummy run completion is handled by the dummy function itself.
-            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Scheduler job (dummy pipeline) attempted.")
+            print(f"[{job_end_time_str}] Scheduler job finished successfully (Gmail pipeline).")
 
     except Exception as e:
-        current_time_error = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{current_time_error}] Error during scheduled job execution: {e}")
-        # In a real application, log more details, e.g., traceback.
+        pipeline_success = False
+        pipeline_error_message = str(e)
+        job_end_time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{job_end_time_str}] Error during scheduled job (Gmail pipeline execution): {e}")
+
+    # --- Send Notification ---
+    if _notifier_available:
+        print("Attempting to send notification via Telegram...")
+        try:
+            # Notifier will use token/chat_id from config.py or environment variables
+            notifier = TelegramNotifier()
+
+            timestamp_for_notif = job_end_time_str.split(" ")[1] # Extract HH:MM:SS
+
+            if pipeline_success:
+                if _using_dummy_pipeline:
+                    message = f"✅ Agenda Manager (Dummy Pipeline) finished successfully at {timestamp_for_notif} KST."
+                else:
+                    message = f"✅ Agenda Manager pipeline finished successfully at {timestamp_for_notif} KST."
+            else:
+                error_summary = (pipeline_error_message[:75] + '...') if pipeline_error_message and len(pipeline_error_message) > 75 else pipeline_error_message
+                if _using_dummy_pipeline:
+                    message = f"⚠️ Agenda Manager (Dummy Pipeline) encountered an error at {timestamp_for_notif} KST: {error_summary or 'Unknown error'}"
+                else:
+                    message = f"⚠️ Agenda Manager pipeline failed at {timestamp_for_notif} KST. Error: {error_summary or 'Unknown error'}"
+
+            # Escape MarkdownV2 special characters for the message to be sent
+            # For simplicity, this example does not include a full MarkdownV2 escaper.
+            # Characters like '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'
+            # need to be escaped with a preceding '\' if they are part of the literal text.
+            # Example: "Error: Something went wrong." -> "Error: Something went wrong\\."
+            # For now, we send it as is, assuming simple error messages or that the library handles some cases.
+            # A proper escaper function should be used for arbitrary text.
+
+            notif_success = notifier.send_message(message) # Assumes message is MarkdownV2 compatible
+            if notif_success:
+                print("Notification sent successfully via Telegram.")
+            else:
+                print("Failed to send Telegram notification (see notifier logs for details).")
+        except ValueError as ve:
+             print(f"Failed to initialize TelegramNotifier (configuration error): {ve}. Notification not sent.")
+        except Exception as e:
+            print(f"An unexpected error occurred while attempting to send Telegram notification: {e}")
+    else:
+        print("Telegram notification system not available (import failed or disabled). Skipping notification.")
+
 
 if __name__ == '__main__':
-    print("Directly testing scheduled_job()...")
+    print("Directly testing scheduled_job() with notification logic...")
 
-    # Example of how one might adjust sys.path if running this file directly
-    # and main.py is in the parent directory.
-    # import os
-    # current_script_path = os.path.abspath(__file__)
-    # project_root_dir = os.path.abspath(os.path.join(os.path.dirname(current_script_path), '..'))
-    # if project_root_dir not in sys.path:
-    #    print(f"Adding project root to sys.path: {project_root_dir}")
-    #    sys.path.insert(0, project_root_dir)
-    #    # Try to re-import if needed, though this is tricky for module-level imports.
-    #    # It's generally better to run from the project root or have PYTHONPATH set.
-    #    try:
-    #        from main import run_gmail_ingestion_pipeline as rpip_reimported
-    #        globals()['run_gmail_ingestion_pipeline'] = rpip_reimported
-    #        globals()['_using_dummy_pipeline'] = False
-    #        print("Successfully re-imported run_gmail_ingestion_pipeline after path adjustment.")
-    #    except ImportError as e_reimport:
-    #        print(f"Re-import failed even after path adjustment: {e_reimport}")
-
+    # Test success path
+    print("\n--- Testing SUCCESS notification path ---")
+    # To ensure it doesn't use the failure simulation of dummy:
+    if hasattr(scheduler_jobs, '_using_dummy_pipeline') and scheduler_jobs._using_dummy_pipeline:
+         print("(Note: Using dummy pipeline for this test run as real one failed to import in jobs.py)")
     scheduled_job()
-    print("Direct test of scheduled_job() complete.")
+
+    # Test failure path (if dummy pipeline is active and can simulate failure)
+    if hasattr(scheduler_jobs, '_using_dummy_pipeline') and scheduler_jobs._using_dummy_pipeline:
+        print("\n--- Testing FAILURE notification path (using dummy pipeline) ---")
+        scheduled_job(simulate_failure_for_user="simulate_pipeline_failure")
+    else:
+        print("\nSkipping FAILURE notification path test as it relies on configurable dummy pipeline failure.")
+
+    print("\nDirect test of scheduled_job() complete.")

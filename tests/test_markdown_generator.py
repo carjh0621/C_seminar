@@ -9,7 +9,7 @@ from persistence.models import TaskStatus # Assuming TaskStatus enum is here
 
 # Helper MockTask class for tests
 class MockTask:
-    def __init__(self, id, title, due_dt_val, status_val, task_type="personal", body=""):
+    def __init__(self, id, title, due_dt_val, status_val, task_type="personal", body="", tags: str | None = None): # Added tags
         self.id = id
         self.title = title
         # due_dt_val can be a datetime object, a string to be parsed, or None
@@ -23,11 +23,14 @@ class MockTask:
             raise ValueError(f"Unsupported type for due_dt_val: {type(due_dt_val)}")
 
         self.status = status_val # This should be the enum member, e.g., TaskStatus.TODO
-        self.type = task_type
+        self.type = task_type # This becomes a primary tag like #personal
         self.body = body
+        self.tags = tags # Comma-separated string e.g., "urgent,#projectX"
         # Add other attributes if your template uses them extensively, otherwise keep minimal
         self.source = "mock_source"
         self.created_dt = datetime.now()
+        # Add fingerprint if it's used by template or writer logic being tested for tags
+        self.fingerprint = f"fp_{id}" # Dummy fingerprint
 
 
 class TestObsidianWriter(unittest.TestCase):
@@ -86,28 +89,60 @@ class TestObsidianWriter(unittest.TestCase):
         self.assertEqual(list(grouped.keys()), [date(2024, 3, 10), date(2024, 3, 11)])
 
 
-    def test_render_agenda_output_content(self):
+    def test_render_agenda_output_content_and_tags(self): # Combined or make new test
         tasks = [
-            MockTask(1, "Meeting A", datetime(2024, 3, 10, 10, 0), TaskStatus.TODO, "meeting"),
-            MockTask(2, "Homework B", datetime(2024, 3, 11, 15, 0), TaskStatus.DONE, "assignment"),
-            MockTask(3, "All-day task", datetime(2024, 3, 10, 0, 0), TaskStatus.TODO, "general"), # All-day
+            MockTask(1, "Meeting A", datetime(2024, 3, 10, 10, 0), TaskStatus.TODO, task_type="meeting", tags="important,#projectY"),
+            MockTask(2, "Homework B", datetime(2024, 3, 11, 15, 0), TaskStatus.DONE, task_type="assignment", tags=None),
+            MockTask(3, "Personal Errand", datetime(2024, 3, 11, 10, 0), TaskStatus.TODO, task_type="personal", tags=" #conflict , urgent "), # Tags with spaces, missing #
+            MockTask(4, "Cancelled Item", datetime(2024, 3, 12, 0, 0, 0), TaskStatus.CANCELLED, task_type="event", tags="cancelled_early"), # All day, time should not show
+            MockTask(5, "Default Type Task", datetime(2024, 3, 12, 11, 0), TaskStatus.TODO, task_type=None, tags="misc"), # No task.type
+            MockTask(6, "Duplicate Type Tag", datetime(2024, 3, 13, 10, 0), TaskStatus.TODO, task_type="meeting", tags="#meeting,extra"), # task.type 'meeting' also in tags
         ]
         try:
             self.writer.render_agenda(tasks, self.temp_output_file, today=self.today)
-        except jinja2.TemplateNotFound:
+        except jinja2.TemplateNotFound: # type: ignore
             self.fail(f"Template agenda.md.j2 not found. Searched in: {self.writer.env.loader.searchpath}")
 
         with open(self.temp_output_file, "r", encoding="utf-8") as f:
             content = f.read()
 
-        # 2024-03-10 is a Sunday
-        self.assertIn("## 2024-03-10 (일)", content)
-        self.assertIn("- [ ] All-day task (D-Day) #general", content) # No time for 00:00 task
-        self.assertIn("- [ ] 10:00 Meeting A (D-Day) #meeting", content)
+        # print(f"DEBUG Output for tags test:\n{content}") # For debugging test
 
-        # 2024-03-11 is a Monday
+        # Task 1: Meeting A with tags
+        # Expected order by template logic: #meeting #important #projectY (alphabetical after primary)
+        self.assertIn("## 2024-03-10 (일)", content)
+        self.assertIn("- [ ] 10:00 Meeting A (D-Day) #meeting #important #projectY", content)
+
+        # Task 2: Homework B, no extra tags, only type tag
         self.assertIn("## 2024-03-11 (월)", content)
         self.assertIn("- ~~[x] 15:00 Homework B~~ (D-1 남음) #assignment", content)
+
+        # Task 3: Personal Errand, tags need cleaning and prefixing
+        # Expected order by template logic: #personal #conflict #urgent (alphabetical after primary)
+        self.assertIn("- [ ] 10:00 Personal Errand (D-1 남음) #personal #conflict #urgent", content)
+
+        # Task 4: Cancelled Item, all day (no time), tags
+        # Expected order: #event #cancelled_early
+        self.assertIn("## 2024-03-12 (화)", content)
+        self.assertIn("- ~~[c] Cancelled Item~~ (D-2 남음) #event #cancelled_early", content) # Note [c] for cancelled
+
+        # Task 5: Default Type Task uses #task, plus its own tag
+        # Expected order: #task #misc
+        self.assertIn("- [ ] 11:00 Default Type Task (D-2 남음) #task #misc", content)
+
+        # Task 6: Duplicate Type Tag - #meeting should not appear twice
+        # Expected order: #meeting #extra
+        self.assertIn("## 2024-03-13 (수)", content)
+        self.assertIn("- [ ] 10:00 Duplicate Type Tag (D-3 남음) #meeting #extra", content)
+        # Verify #meeting is not duplicated by searching for a double tag (space matters)
+        # This depends on how tags_display_string is constructed. If it's always "#type #tag1 #tag2",
+        # then "#meeting #meeting" could appear if logic is flawed.
+        # The current template logic (add to list if not in list) should prevent this.
+        # A simple string count for "#meeting" should be 1 in this line if no other tasks are "meeting" type.
+        # More robust: check the specific line for count of "#meeting"
+        task6_line = "- [ ] 10:00 Duplicate Type Tag (D-3 남음) #meeting #extra"
+        self.assertEqual(task6_line.count("#meeting"), 1, "Primary type tag #meeting duplicated in output for Task 6")
+
 
     def test_render_empty_tasks(self):
         try:

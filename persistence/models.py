@@ -1,6 +1,5 @@
 import enum
-from sqlalchemy import Column, Integer, String, DateTime, Enum as SQLAlchemyEnum, ForeignKey
-# Removed func from import as it's not used directly in this version of model default/onupdate
+from sqlalchemy import Column, Integer, String, DateTime, Enum as SQLAlchemyEnum, ForeignKey, UniqueConstraint
 # For server-side defaults/onupdate with func.now(), it would be needed.
 # SQLAlchemy handles Python-side defaults like datetime.utcnow automatically.
 from sqlalchemy.ext.declarative import declarative_base
@@ -17,65 +16,70 @@ class Task(Base):
     __tablename__ = "tasks"
 
     id = Column(Integer, primary_key=True, index=True)
-    source = Column(String, index=True) # e.g., 'gmail', 'manual', 'obsidian_note'
+    source = Column(String, index=True) # e.g., 'gmail_messageId123', 'manual_entry', 'obsidian_note_uuid'
     title = Column(String, nullable=False)
     body = Column(String, nullable=True)
-    due_dt = Column(DateTime, nullable=True)
-    created_dt = Column(DateTime, default=datetime.utcnow)
+    due_dt = Column(DateTime, nullable=True, index=True) # Added index for due_dt
+    created_dt = Column(DateTime, default=datetime.utcnow, nullable=False)
     status = Column(SQLAlchemyEnum(TaskStatus), default=TaskStatus.TODO, nullable=False)
-    countdown_int = Column(Integer, nullable=True) # Stores pre-calculated D-Day if needed, or null
-    last_seen_dt = Column(DateTime, nullable=True) # For external systems, when was this item last seen
+
+    # Fields for D-day calculation (as per original spec, though calculation is external)
+    # countdown_int can be populated by a separate process or when tasks are queried.
+    countdown_int = Column(Integer, nullable=True)
+    last_seen_dt = Column(DateTime, nullable=True) # For external systems, when was this item last seen/synced
+
+    # --- New fields for deduplication and conflict management ---
+    # Fingerprint for identifying potentially duplicate tasks.
+    # Unique constraint ensures no two tasks (that have a fingerprint) can be identical.
+    # Nullable because not all tasks might have a fingerprint (e.g. manually added, or if generation fails).
+    fingerprint = Column(String, index=True, unique=True, nullable=True)
+
+    # Comma-separated string for tags like '#conflict', '#projectX', '#urgent'
+    tags = Column(String, nullable=True)
+    # --- End new fields ---
 
     def __repr__(self):
-        return f"<Task(id={self.id}, title='{self.title}', status='{self.status.value if self.status else None}')>"
+        return (f"<Task(id={self.id}, title='{self.title}', "
+                f"due_dt='{self.due_dt.isoformat() if self.due_dt else None}', "
+                f"status='{self.status.name if self.status else None}', "
+                f"fingerprint='{self.fingerprint}')>")
+
 
 class SourceToken(Base):
     __tablename__ = "source_tokens"
 
     id = Column(Integer, primary_key=True, index=True)
-    # Application-specific user identifier (e.g., "default_user", or a UUID)
-    # This allows for potential multi-user or multi-profile setups in the future.
     user_id = Column(String, index=True, nullable=False)
-
-    platform = Column(String, index=True, nullable=False) # e.g., 'gmail', 'kakaotalk', 'google_calendar'
+    platform = Column(String, index=True, nullable=False)
     access_token = Column(String, nullable=False)
     refresh_token = Column(String, nullable=True)
-    expires_dt = Column(DateTime, nullable=True) # Expiry datetime of the access_token (UTC)
+    expires_dt = Column(DateTime, nullable=True)
+    scopes = Column(String, nullable=True)
+    token_uri = Column(String, nullable=True)
+    client_id = Column(String, nullable=True)
+    client_secret = Column(String, nullable=True) # HIGHLY SENSITIVE - consider encryption or alternative storage
 
-    # New fields for richer token storage, especially for Google OAuth Credentials object
-    scopes = Column(String, nullable=True)  # Space-separated list of scopes
-    token_uri = Column(String, nullable=True) # Token endpoint URI
-    client_id = Column(String, nullable=True) # Client ID used to obtain the token
-    # Storing client_secret in the database is generally discouraged due to its sensitivity.
-    # If stored, it MUST be encrypted. Often, it's better to load client_secret from a config file
-    # when reconstructing the Credentials object, rather than storing it with each token.
-    client_secret = Column(String, nullable=True) # OAuth client secret (HIGHLY SENSITIVE)
+    created_dt = Column(DateTime, default=datetime.utcnow, nullable=False)
+    last_modified_dt = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
-    created_dt = Column(DateTime, default=datetime.utcnow)
-    # For last_modified_dt with onupdate=datetime.utcnow, SQLAlchemy handles this by
-    # setting the value when the ORM object is flushed, if it's marked as modified.
-    # For databases that support onupdate in DDL (like MySQL), you could use func.now() from sqlalchemy.sql
-    last_modified_dt = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    # To enforce that a user can only have one token per platform:
-    # from sqlalchemy.schema import UniqueConstraint
-    # __table_args__ = (UniqueConstraint('user_id', 'platform', name='uq_user_platform_token'),)
-    # This is typically managed via database migrations (e.g., with Alembic) in larger projects.
-    # The application logic in crud.save_token (get then update/create) also handles this.
+    # Enforce that a user can only have one token per platform.
+    __table_args__ = (UniqueConstraint('user_id', 'platform', name='uq_user_platform_token'),)
 
     def __repr__(self):
-        return f"<SourceToken(id={self.id}, user_id='{self.user_id}', platform='{self.platform}', expires_dt='{self.expires_dt}')>"
+        return (f"<SourceToken(id={self.id}, user_id='{self.user_id}', "
+                f"platform='{self.platform}', expires_dt='{self.expires_dt.isoformat() if self.expires_dt else None}')>")
 
 class FileCursor(Base):
     __tablename__ = "file_cursors"
 
     id = Column(Integer, primary_key=True, index=True)
-    obsidian_file = Column(String, nullable=False, unique=True) # File path or unique file ID
-    line_no_end = Column(Integer, nullable=False) # Last processed line number
-    last_rotated_dt = Column(DateTime, nullable=False, default=datetime.utcnow) # When this file was last processed or rotated
+    obsidian_file = Column(String, nullable=False, unique=True)
+    line_no_end = Column(Integer, nullable=False)
+    last_rotated_dt = Column(DateTime, nullable=False, default=datetime.utcnow)
 
     def __repr__(self):
-        return f"<FileCursor(id={self.id}, obsidian_file='{self.obsidian_file}', line_no_end={self.line_no_end})>"
+        return (f"<FileCursor(id={self.id}, obsidian_file='{self.obsidian_file}', "
+                f"line_no_end={self.line_no_end})>")
 
-# Informational print statement (optional)
+# Informational print statement (optional, can be removed)
 # print("Persistence models (Task, SourceToken, FileCursor) defined with SQLAlchemy Base.")
