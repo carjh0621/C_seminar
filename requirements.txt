@@ -8,4 +8,6 @@ google-auth-oauthlib
 openai
 pytz
 python-telegram-bot
+rich
 sqlalchemy
+typer
