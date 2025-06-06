@@ -14,6 +14,15 @@ from persistence import crud as persistence_crud # To call get_token, save_token
 
 import base64 # For decoding message body in _parse_email_parts
 
+# --- Imports for KakaoAgent ---
+from playwright.sync_api import Playwright, BrowserContext, Page, Browser, Error as PlaywrightError, Locator
+from typing import List, Dict, Optional
+import hashlib
+import time # For small delays if needed
+import sys # For logger fallback
+import logging # For KakaoAgent logger
+# --- End Imports for KakaoAgent ---
+
 class GmailAgent:
     SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 
@@ -35,7 +44,7 @@ class GmailAgent:
                 print(f"Token found in DB for '{app_user_id}', platform 'gmail'. Reconstructing credentials.")
 
                 client_id_from_db = db_token_record.client_id
-                client_secret_from_db = db_token_record.client_secret # Might be None or sensitive
+                client_secret_from_db = db_token_record.client_secret
                 token_uri_from_db = db_token_record.token_uri
 
                 client_id_for_refresh = client_id_from_db
@@ -181,10 +190,11 @@ class GmailAgent:
         query = None
         if since_date_str:
             try:
-                datetime.strptime(since_date_str, "%Y-%m-%d")
-                query = f"after:{since_date_str.replace('-', '/')}"
+                # Validate format if needed, though strftime should produce correct YYYY/MM/DD
+                # datetime.strptime(since_date_str, "%Y/%m/%d")
+                query = f"after:{since_date_str}" # Gmail uses YYYY/MM/DD for 'after'
             except ValueError:
-                print(f"Invalid since_date_str format: {since_date_str}. Ignoring date filter.")
+                print(f"Invalid since_date_str format: {since_date_str}. Must be YYYY/MM/DD. Ignoring date filter.")
 
         try:
             print(f"Fetching list of messages with query: '{query if query else 'None'}' (max: {max_results})...")
@@ -210,7 +220,7 @@ class GmailAgent:
                         'body_plain': plain_body, 'body_html': html_body, 'source': 'gmail'
                     }
                     fetched_emails.append(email_details)
-                    print(f"Successfully processed message ID: {msg_id}, Subject: '{headers_dict.get('subject', 'N/A')[:50]}...'")
+                    # print(f"Successfully processed message ID: {msg_id}, Subject: '{headers_dict.get('subject', 'N/A')[:50]}...'")
                 except HttpError as error: print(f'Error fetching details for message ID {msg_id}: {error}')
                 except Exception as e: print(f'Unexpected error processing message ID {msg_id}: {e}')
             print(f"\nFinished fetching details for {len(fetched_emails)} messages.")
@@ -229,301 +239,186 @@ if __name__ == '__main__':
         gmail_service = agent.authenticate_gmail(app_user_id=test_app_user)
         if gmail_service:
             print(f"Authentication successful for {test_app_user}.")
-            print("Fetching up to 2 recent emails...")
-            emails = agent.fetch_messages(max_results=2)
-            if emails:
-                print(f"Successfully fetched {len(emails)} emails for {test_app_user}:")
-                for i, email_info in enumerate(emails):
-                    print(f"  Email {i+1}: Subject: {email_info['headers'].get('subject', 'N/A')}")
-            else:
-                print(f"No emails fetched for {test_app_user}.")
+            # print("Fetching up to 2 recent emails...")
+            # emails = agent.fetch_messages(max_results=2)
+            # if emails:
+            #     print(f"Successfully fetched {len(emails)} emails for {test_app_user}:")
+            #     for i, email_info in enumerate(emails):
+            #         print(f"  Email {i+1}: Subject: {email_info['headers'].get('subject', 'N/A')}")
+            # else:
+            #     print(f"No emails fetched for {test_app_user}.")
         else:
             print(f"Authentication failed for {test_app_user}.")
             print("Ensure 'credentials.json' is valid and you've completed the OAuth flow if prompted.")
             print("Also check database connectivity and the SourceToken table schema.")
 
-# --- New Imports for KakaoAgent (Playwright) ---
-from playwright.sync_api import Playwright, BrowserContext, Page, Browser, Error as PlaywrightError
-from typing import List, Dict, Optional # Added for KakaoAgent type hints
-# --- End New Imports ---
-
 class KakaoAgent:
-    """
-    Agent for interacting with KakaoTalk using Playwright.
-    Note: Automating KakaoTalk can be challenging due to its structure
-    and potential for changes. This implementation will be experimental.
-    """
-    def __init__(self, playwright_instance: Playwright, user_data_dir: Optional[str] = None, headless: bool = False):
-        """
-        Initializes the KakaoAgent.
+    # --- BEGIN CONCEPTUAL SELECTORS (Developer must replace these) ---
+    CONCEPTUAL_SELECTORS = {
+        "chat_list_container": "div[data-testid='chat-list-scroll-area']",
+        "chat_list_item_role": "listitem",
+        "message_area_container": "div[data-testid='message-scroll-area']",
+        "message_bubble_role": "div[role='listitem'][aria-label*='message']",
+        "message_sender_selector": "div[data-testid='sender-name']",
+        "message_text_selector": "div[data-testid='message-text-content']",
+        "message_timestamp_selector": "span[data-testid='message-timestamp']",
+    }
+    # --- END CONCEPTUAL SELECTORS ---
 
-        Args:
-            playwright_instance: An active Playwright object (from `with sync_playwright() as p:`).
-            user_data_dir: Optional path to a directory for persistent browser user data (for logins).
-            headless: Whether to run the browser in headless mode. Default is False for KakaoTalk.
-        """
-        self.pw_instance: Playwright = playwright_instance
-        self.user_data_dir: Optional[str] = user_data_dir
-        self.headless: bool = headless
+    def __init__(self, playwright_instance: Playwright, user_data_dir: Optional[str] = None, headless: bool = False):
+        self.pw_instance = playwright_instance
+        self.user_data_dir = user_data_dir
+        self.headless = headless
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
-        print(f"KakaoAgent initialized. User data dir: {self.user_data_dir}, Headless: {self.headless}")
+        self.logger = self._get_logger()
+        self.logger.info(f"KakaoAgent initialized. User data dir: {self.user_data_dir}, Headless: {self.headless}")
 
+    def _get_logger(self):
+        logger = logging.getLogger(f"agenda_manager.{self.__class__.__name__}")
+        if not logger.handlers and not logging.getLogger().handlers:
+            handler = logging.StreamHandler(sys.stdout)
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+            logger.setLevel(logging.INFO)
+            logger.propagate = False
+        return logger
 
     def login(self, timeout_ms: int = 60000) -> bool:
-        """
-        Launches a browser for KakaoTalk interaction.
-        This initial version relies on the user manually logging into their KakaoTalk PC client.
-        Playwright launches a browser that can be used for other web tasks, or potentially
-        to interact with a web-based Kakao interface if one is used/targeted in the future.
-        The primary goal here is to have a browser context ready.
-
-        Args:
-            timeout_ms: Maximum time to wait for page navigation (in milliseconds).
-
-        Returns:
-            True if browser setup is successful, False otherwise.
-        """
-        print(f"KakaoAgent: Initializing browser for KakaoTalk interaction.")
-        # Important Note on KakaoTalk PC Automation is in the class docstring / previous comments.
-
-        if self.context and self.page: # Check if already initialized
-            print("  Browser context and page already exist. Assuming active session.")
-            # Optionally, could try a quick self.page.url() or a lightweight check here.
-            return True
-
+        self.logger.info(f"Attempting login (timeout: {timeout_ms}ms)...")
+        self.logger.warning("IMPORTANT: KakaoAgent login requires KakaoTalk PC to be running and logged in manually.")
         try:
+            if self.context and self.page:
+                self.logger.info("Browser context already exists. Assuming active session.")
+                return True
+
             launch_args_default = ['--disable-blink-features=AutomationControlled']
-            # Headless argument for chromium.launch is a boolean, not in args list directly for that.
-            # For launch_persistent_context, headless is a direct param, and args can supplement.
-
             if self.user_data_dir:
-                print(f"  Launching persistent browser context using user_data_dir: {self.user_data_dir}")
+                self.logger.info(f"Launching persistent browser context: {self.user_data_dir}")
                 self.context = self.pw_instance.chromium.launch_persistent_context(
-                    self.user_data_dir,
-                    headless=self.headless,
-                    args=launch_args_default,
-                    # viewport=None, # Let it use default or be set later if needed
-                    # no_viewport=True if self.headless else None # Use with caution, can affect layout
+                    self.user_data_dir, headless=self.headless, args=launch_args_default
                 )
-                # For persistent context, self.browser is technically self.context.browser but we don't manage its lifecycle.
-                self.browser = None # Explicitly set to None as we don't "own" this browser lifecycle
-
-                if not self.context.pages():
-                    self.page = self.context.new_page()
-                else:
-                    self.page = self.context.pages[0]
-                print("  Persistent browser context launched.")
+                self.browser = None
+                self.page = self.context.pages()[0] if self.context.pages() else self.context.new_page()
             else:
-                print("  Launching new browser instance (non-persistent).")
+                self.logger.info("Launching new browser instance (non-persistent).")
                 self.browser = self.pw_instance.chromium.launch(headless=self.headless, args=launch_args_default)
-                self.context = self.browser.new_context(
-                    # viewport=None
-                )
+                self.context = self.browser.new_context()
                 self.page = self.context.new_page()
-                print("  New browser instance launched.")
 
-            if not self.page: # Should not happen if logic above is correct
-                print("  [Error] Page object was not created.")
+            if not self.page:
+                self.logger.error("Page object not created after browser/context launch.")
                 self.close()
                 return False
 
-            print("  Navigating to a test page (google.com) to verify browser control...")
+            self.logger.info("Navigating to test page (google.com) to verify browser control...")
             self.page.goto("https://google.com", timeout=timeout_ms // 2)
-            page_title = self.page.title() # Get title after navigation
-            print(f"  Successfully navigated to: {page_title}")
-
-            print("  Browser is ready. IMPORTANT: Please ensure KakaoTalk PC client is running and logged in manually.")
-            print("  KakaoAgent.login() successful (browser launched and test page loaded).")
+            self.logger.info(f"Successfully navigated to: {self.page.title()}")
+            self.logger.info("Browser ready. Ensure KakaoTalk PC is running and logged in.")
             return True
-
         except PlaywrightError as e:
-            print(f"  Playwright error during KakaoAgent login/setup: {e}")
+            self.logger.error(f"Playwright error during login/setup: {e}", exc_info=True)
             self.close()
             return False
         except Exception as e:
-            print(f"  Unexpected error during KakaoAgent login/setup: {e}")
+            self.logger.error(f"Unexpected error during login/setup: {e}", exc_info=True)
             self.close()
             return False
 
     def select_chat(self, chat_name: str, timeout_ms: int = 30000) -> bool:
-        method_name = "KakaoAgent.select_chat"
-        print(f"{method_name}: Attempting to select chat: '{chat_name}' (timeout: {timeout_ms}ms)...")
-
+        self.logger.info(f"Attempting to select chat: '{chat_name}' (timeout: {timeout_ms}ms)...")
         if not self.page:
-            print(f"Error ({method_name}): Page object not available. Login must be successful first.")
+            self.logger.error("Page object not available. Login must be successful first.")
             return False
-
-        # --- CONCEPTUAL SELECTOR ---
-        # This needs to be replaced with actual selectors from KakaoTalk DOM inspection.
-        # Using Playwright's role and text based locator as a robust example.
-        print(f"  ({method_name}): Using conceptual locator strategy (get_by_role 'listitem', name='{chat_name}').")
 
         try:
-            # Attempt to find a list item (common for chat lists) that has the specified name (aria-label or text content).
-            # .first is used if multiple items might match the role but the name makes it specific.
-            chat_item_locator = self.page.get_by_role("listitem", name=chat_name).first
+            chat_item_locator = self.page.get_by_role(
+                self.CONCEPTUAL_SELECTORS["chat_list_item_role"], name=chat_name
+            ).first
 
-            print(f"  ({method_name}): Attempting to click chat item '{chat_name}'...")
-            # Default timeout for click is often sufficient if element is readily available.
-            # Can specify timeout: chat_item_locator.click(timeout=timeout_ms)
+            self.logger.info(f"Attempting to click chat item '{chat_name}' using conceptual selector: "
+                             f"role='{self.CONCEPTUAL_SELECTORS['chat_list_item_role']}', name='{chat_name}'.")
             chat_item_locator.click(timeout=timeout_ms)
 
-            # TODO: Add a verification step after clicking to confirm the chat opened.
-            # This is crucial for robust automation.
-            # Example (conceptual):
-            # active_chat_header_locator = self.page.locator(f"header[data-testid='active-chat-title']:has-text('{chat_name}')")
-            # active_chat_header_locator.wait_for(state='visible', timeout=5000) # Wait for header to be visible
-
-            print(f"Success ({method_name}): Clicked on chat item '{chat_name}'. (Post-click verification needed).")
+            self.logger.info(f"Successfully clicked on chat item '{chat_name}'. (Post-click verification needed).")
             return True
-
         except PlaywrightError as e:
-            # This can catch various Playwright-specific errors, including timeout errors if element not found.
-            print(f"Error ({method_name}): Playwright error selecting chat '{chat_name}' (e.g., element not found or timeout): {e}")
+            self.logger.error(f"Playwright error selecting chat '{chat_name}' (e.g., timeout or element not found): {e}")
             return False
         except Exception as e:
-            # Catch any other unexpected errors during the process.
-            print(f"Error ({method_name}): Unexpected error while selecting chat '{chat_name}': {e}")
+            self.logger.error(f"Unexpected error selecting chat '{chat_name}': {e}", exc_info=True)
             return False
 
-    def read_messages(self, num_messages_to_capture: int = 20, scroll_attempts: int = 3) -> List[Dict]:
     def read_messages(self, num_messages_to_capture: int = 20, scroll_attempts: int = 0) -> List[Dict]:
-        """
-        Reads messages from the currently selected chat using Playwright.
-        Uses CONCEPTUAL selectors that need to be replaced with actual ones.
-        Initial version focuses on visible messages; scrolling is a TODO.
-
-        Args:
-            num_messages_to_capture: Target number of recent messages to try to capture.
-                                     (Currently will fetch visible, up to this number)
-            scroll_attempts: Number of times to scroll up (Not implemented in this version).
-
-        Returns:
-            A list of dictionaries, each representing a message.
-            Example: {'id': 'k_...', 'sender': 'SenderName',
-                      'timestamp_str': '오후 3:45', 'text': 'Message content'}
-        """
-        method_name = "KakaoAgent.read_messages"
-        print(f"{method_name}: Reading up to {num_messages_to_capture} messages...")
-
+        self.logger.info(f"Reading up to {num_messages_to_capture} messages (scroll attempts: {scroll_attempts})...")
         if not self.page:
-            print(f"Error ({method_name}): Page object not available. A chat must be selected first.")
+            self.logger.error("Page not available. A chat must be selected first.")
             return []
 
         if scroll_attempts > 0:
-            print(f"  Info ({method_name}): Scrolling ({scroll_attempts} attempts) is not yet implemented. Reading visible messages only.")
-            # TODO: Implement scrolling logic here in the future.
-            # For example:
-            # for _ in range(scroll_attempts):
-            #     self.page.keyboard.press("PageUp") # Or mouse wheel scroll on message container
-            #     self.page.wait_for_timeout(500) # Wait for content to load
+            self.logger.info(f"Scrolling ({scroll_attempts} attempts) is not yet implemented. Reading visible messages only.")
 
         messages: List[Dict] = []
-
-        # --- CONCEPTUAL SELECTORS for message components ---
-        # These need to be replaced with actual selectors from KakaoTalk DOM inspection.
-        # Example: message_elements_locator = self.page.locator("div.chat_message_bubble")
-        message_elements_locator = self.page.locator("div[role='listitem'][aria-label*='message']") # Conceptual: finds message list items
-
-        print(f"  ({method_name}): Attempting to locate message elements using conceptual selector...")
-
         try:
-            # Fetch all currently visible/DOM-rendered message elements matching the locator
-            visible_message_elements = message_elements_locator.all() # Gets all current matches as Locator list
-            print(f"  ({method_name}): Found {len(visible_message_elements)} potential message elements in DOM.")
+            message_elements_locator = self.page.locator(
+                self.CONCEPTUAL_SELECTORS["message_bubble_role"]
+            )
+            all_message_locators = message_elements_locator.all()
+            self.logger.info(f"Found {len(all_message_locators)} potential message elements in DOM using conceptual selector.")
+            elements_to_process = all_message_locators[-num_messages_to_capture:]
 
-            # Process messages, typically from bottom up (most recent) if that's how they appear in DOM
-            # Slicing to get the last num_messages_to_capture elements
-            elements_to_process = visible_message_elements[-num_messages_to_capture:]
-
-            for i, msg_element_locator in enumerate(elements_to_process):
-                # msg_element_locator is now a Playwright Locator for a single message element
-                print(f"  ({method_name}): Processing message element {i+1}...")
+            for i, msg_locator in enumerate(elements_to_process):
                 try:
-                    # Conceptual sub-selectors relative to the msg_element_locator
-                    # These data-testid attributes are purely examples.
-                    sender_locator = msg_element_locator.locator("span[data-testid='sender']")
-                    text_locator = msg_element_locator.locator("div[data-testid='message-text']")
-                    timestamp_locator = msg_element_locator.locator("span[data-testid='timestamp']")
+                    sender_loc = msg_locator.locator(self.CONCEPTUAL_SELECTORS["message_sender_selector"])
+                    text_loc = msg_locator.locator(self.CONCEPTUAL_SELECTORS["message_text_selector"])
+                    timestamp_loc = msg_locator.locator(self.CONCEPTUAL_SELECTORS["message_timestamp_selector"])
 
-                    sender = sender_locator.text_content(timeout=500) if sender_locator.count() > 0 else "Unknown Sender"
-                    text = text_locator.text_content(timeout=500) if text_locator.count() > 0 else ""
-                    timestamp_str = timestamp_locator.text_content(timeout=500) if timestamp_locator.count() > 0 else "Unknown Time"
+                    sender = sender_loc.text_content(timeout=500).strip() if sender_loc.count() > 0 else "Unknown Sender"
+                    text = text_loc.text_content(timeout=500).strip() if text_loc.count() > 0 else ""
+                    timestamp_str = timestamp_loc.text_content(timeout=500).strip() if timestamp_loc.count() > 0 else "Unknown Time"
 
-                    sender = sender.strip()
-                    text = text.strip()
-                    timestamp_str = timestamp_str.strip()
-
-                    if not text and sender == "Unknown Sender": # Skip if no text and sender is also unknown
-                        print(f"    ({method_name}): Skipping message with empty text and unknown sender.")
+                    if not text and sender == "Unknown Sender":
+                        self.logger.debug(f"Skipping message element {i+1} due to empty text and unknown sender.")
                         continue
 
-                    # Generate a simple ID (can be improved with more message metadata if available)
-                    msg_id_str = f"{sender}_{timestamp_str}_{text[:20]}" # Use first 20 chars of text for hash
-                    msg_id = f"k_{hashlib.sha1(msg_id_str.encode('utf-8')).hexdigest()[:10]}"
+                    msg_id_str = f"{sender}_{timestamp_str}_{text[:30]}"
+                    msg_id = f"k_{hashlib.sha1(msg_id_str.encode('utf-8')).hexdigest()[:12]}"
 
-                    messages.append({
-                        'id': msg_id,
-                        'sender': sender,
-                        'timestamp_str': timestamp_str,
-                        'text': text
-                    })
-                    print(f"    ({method_name}): Extracted: Sender='{sender}', Time='{timestamp_str}', Text='{text[:30].replace(chr(10), ' ')}...'")
-
+                    messages.append({'id': msg_id, 'sender': sender, 'timestamp_str': timestamp_str, 'text': text})
+                    self.logger.debug(f"Extracted: Sender='{sender}', Time='{timestamp_str}', Text='{text[:30].replace(chr(10), ' ')}...'")
                 except PlaywrightError as e_msg:
-                    print(f"  Warning ({method_name}): Playwright error extracting details for a message: {e_msg}")
+                    self.logger.warning(f"Playwright error extracting details for a message element: {e_msg}")
                 except Exception as e_u:
-                    print(f"  Warning ({method_name}): Unexpected error extracting details for a message: {e_u}")
+                    self.logger.warning(f"Unexpected error extracting details for a message element: {e_u}", exc_info=True)
 
-            print(f"  ({method_name}): Successfully extracted {len(messages)} messages.")
-
+            self.logger.info(f"Successfully extracted {len(messages)} messages.")
         except PlaywrightError as e:
-            print(f"Error ({method_name}): Playwright error locating message list or messages: {e}")
-            return []
+            self.logger.error(f"Playwright error locating message list or messages: {e}")
         except Exception as e:
-            print(f"Error ({method_name}): Unexpected error reading messages: {e}")
-            return []
-
+            self.logger.error(f"Unexpected error reading messages: {e}", exc_info=True)
         return messages
 
     def close(self):
-        """
-        Closes the Playwright browser and context.
-        """
-        print("KakaoAgent: Closing browser resources...")
+        self.logger.info("Closing browser resources...")
         closed_something = False
         if self.page:
-            try:
-                self.page.close()
-                self.page = None
-                closed_something = True
-                print("  Page closed.")
-            except Exception as e: print(f"  Error closing page: {e}")
+            try: self.page.close(); closed_something = True; self.logger.debug("Page closed.")
+            except Exception as e: self.logger.error(f"Error closing page: {e}", exc_info=True)
+        self.page = None
 
         if self.context:
-            try:
-                self.context.close()
-                self.context = None
-                closed_something = True
-                print("  Browser context closed.")
-            except Exception as e: print(f"  Error closing context: {e}")
+            try: self.context.close(); closed_something = True; self.logger.debug("Browser context closed.")
+            except Exception as e: self.logger.error(f"Error closing context: {e}", exc_info=True)
+        self.context = None
 
-        # self.browser is primarily for non-persistent contexts.
-        # Persistent contexts manage their browser lifecycle implicitly when context is closed.
         if self.browser:
-            try:
-                self.browser.close()
-                self.browser = None
-                closed_something = True
-                print("  Browser closed.")
-            except Exception as e: print(f"  Error closing browser: {e}")
+            try: self.browser.close(); closed_something = True; self.logger.debug("Browser closed.")
+            except Exception as e: self.logger.error(f"Error closing browser: {e}", exc_info=True)
+        self.browser = None
 
-        if closed_something:
-            print("KakaoAgent: Browser resources released.")
-        else:
-            print("KakaoAgent: No active Playwright resources were explicitly closed by this agent instance (might be normal for persistent context if browser was pre-existing or if already closed).")
+        if closed_something: self.logger.info("Browser resources released.")
+        else: self.logger.info("No active browser resources were explicitly closed by this agent instance or already closed.")
 
-# Example of __all__ if this file is treated as a package's __init__.py or for explicit exports
 # __all__ = ["GmailAgent", "KakaoAgent"]
