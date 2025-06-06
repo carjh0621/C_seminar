@@ -16,7 +16,8 @@ import os # For path operations
 # --- New imports for Obsidian Sync ---
 from obsidian_sync.parser import parse_markdown_agenda_file
 from obsidian_sync.matcher import find_matching_task_in_db
-from typing import Dict, List, Any # For type hints in sync command, added Any
+from typing import Dict, List, Any # For type hints in sync command
+from extract_nlp.utils import normalize_title_for_fingerprint # Added for title comparison
 # --- End new imports ---
 # --- End Backend Logic Imports ---
 
@@ -400,30 +401,29 @@ def sync_obsidian_changes(
 
     md_tasks_processed = 0
     matched_tasks_count = 0
-    no_status_change_count = 0
+    no_overall_change_count = 0 # Tasks matched but no status, title, or due_dt diff
 
     try:
         md_dates_str = sorted(list(set(md_task['date_str'] for md_task in parsed_md_tasks if md_task['date_str'])))
-        db_tasks_by_date_map: Dict[str, List[Task]] = {} # Cache DB tasks per date
-
+        db_tasks_by_date_map: Dict[str, List[Task]] = {}
         for date_str_to_fetch in md_dates_str:
             try:
                 date_obj = datetime.strptime(date_str_to_fetch, "%Y-%m-%d").date()
-                # Try to use a specific CRUD function if available, otherwise fallback
                 if hasattr(crud, 'get_tasks_on_date'):
-                    db_tasks_by_date_map[date_str_to_fetch] = crud.get_tasks_on_date(db, target_date=date_obj) # type: ignore
-                else: # Fallback if crud.get_tasks_on_date is not implemented
-                    if not hasattr(crud, '_warned_get_tasks_on_date'): # Print warning only once
-                        console.print(f"[yellow]Developer Note: crud.get_tasks_on_date not found, using inefficient fallback for fetching DB tasks by date.[/yellow]")
+                    all_db_tasks_for_day = crud.get_tasks_on_date(db, target_date=date_obj) # type: ignore
+                else:
+                    if not hasattr(crud, '_warned_get_tasks_on_date'):
+                        console.print(f"[yellow]Developer Note: crud.get_tasks_on_date not found, using inefficient fallback.[/yellow]")
                         crud._warned_get_tasks_on_date = True # type: ignore
                     all_db_tasks = crud.get_tasks(db, limit=10000)
-                    db_tasks_by_date_map[date_str_to_fetch] = [t for t in all_db_tasks if t.due_dt and t.due_dt.date() == date_obj]
+                    all_db_tasks_for_day = [t for t in all_db_tasks if t.due_dt and t.due_dt.date() == date_obj]
+                db_tasks_by_date_map[date_str_to_fetch] = all_db_tasks_for_day
             except ValueError:
-                console.print(f"[yellow]Warning: Invalid date string '{date_str_to_fetch}' from MD. Skipping tasks for this date.[/yellow]")
+                console.print(f"[yellow]Warning: Invalid date string '{date_str_to_fetch}' from MD. Skipping.[/yellow]")
                 db_tasks_by_date_map[date_str_to_fetch] = []
 
         for md_task in parsed_md_tasks:
-            md_tasks_processed +=1
+            md_tasks_processed += 1
             md_date_str = md_task.get("date_str")
             if not md_date_str: continue
 
@@ -432,27 +432,83 @@ def sync_obsidian_changes(
 
             if matched_db_task:
                 matched_tasks_count += 1
+                task_changed_details: List[Dict[str,Any]] = [] # Store specific changes for this task
+
+                # --- 1. Compare Status ---
                 md_status_str = md_task.get("status_md")
                 md_status_enum = get_status_from_md_marker(md_status_str) if md_status_str else None
-
                 if md_status_enum and matched_db_task.status != md_status_enum:
-                    potential_updates.append({
-                        "task_id": matched_db_task.id,
-                        "db_title": matched_db_task.title,
+                    task_changed_details.append({
                         "change_type": "status",
-                        "from_db_enum": matched_db_task.status,
-                        "to_md_enum": md_status_enum
+                        "from_db": matched_db_task.status.name if matched_db_task.status else "N/A",
+                        "to_md": md_status_enum.name,
+                        "to_md_enum_or_dt": md_status_enum
                     })
+
+                # --- 2. Compare Title ---
+                md_title = str(md_task.get("title_md", ""))
+                normalized_md_title = normalize_title_for_fingerprint(md_title)
+                normalized_db_title = normalize_title_for_fingerprint(matched_db_task.title)
+                if normalized_md_title != normalized_db_title:
+                    task_changed_details.append({
+                        "change_type": "title",
+                        "from_db": matched_db_task.title,
+                        "to_md": md_title,
+                        "to_md_enum_or_dt": md_title
+                    })
+
+                # --- 3. Compare Due Date ---
+                md_due_datetime: Optional[datetime] = None
+                # Simplified due date resolution from MD: use date_str + time_str if available, else just date_str
+                if md_task.get("time_str"):
+                    md_due_datetime = resolve_date(f"{md_task['date_str']} {md_task['time_str']}")
+                elif md_task['date_str']:
+                    md_due_datetime = resolve_date(md_task['date_str'])
+
+                db_due_dt = matched_db_task.due_dt
+                due_dates_differ = False
+                if md_due_datetime is None and db_due_dt is not None:
+                    due_dates_differ = True
+                elif md_due_datetime is not None and db_due_dt is None:
+                    due_dates_differ = True
+                elif md_due_datetime and db_due_dt:
+                    if md_due_datetime.date() != db_due_dt.date():
+                        due_dates_differ = True
+                    else:
+                        md_time = md_due_datetime.time()
+                        db_time = db_due_dt.time()
+                        is_md_all_day = (md_time == dt_time(0,0,0))
+                        is_db_all_day = (db_time == dt_time(0,0,0))
+                        if is_md_all_day != is_db_all_day:
+                            due_dates_differ = True
+                        elif not is_md_all_day and md_time != db_time:
+                            due_dates_differ = True
+
+                if due_dates_differ:
+                    task_changed_details.append({
+                        "change_type": "due_dt",
+                        "from_db": db_due_dt.isoformat() if db_due_dt else "None",
+                        "to_md": md_due_datetime.isoformat() if md_due_datetime else "None",
+                        "to_md_enum_or_dt": md_due_datetime
+                    })
+
+                if task_changed_details:
+                    for change_detail in task_changed_details:
+                        potential_updates.append({
+                            "task_id": matched_db_task.id,
+                            "db_title": matched_db_task.title, # Original DB title for context
+                            **change_detail # Add change_type, from_db, to_md, to_md_enum_or_dt
+                        })
                 else:
-                    no_status_change_count +=1
+                    no_overall_change_count +=1
 
         # --- Reporting and Applying Changes ---
         if not potential_updates:
-            console.print("[green]No status differences found between Markdown file and database tasks.[/green]")
+            console.print("[green]No differences (status, title, or due date) found between Markdown file and database tasks.[/green]")
         else:
             title_suffix = "(Dry Run)" if dry_run else "(Live Run - Pending Confirmation)"
-            console.print(f"\n[bold yellow]Detected {len(potential_updates)} potential status updates {title_suffix}:[/bold yellow]")
-            table = Table(title=f"Potential Task Status Updates {title_suffix}")
+            console.print(f"\n[bold yellow]Detected {len(potential_updates)} potential updates {title_suffix}:[/bold yellow]")
+            table = Table(title=f"Potential Task Updates {title_suffix}")
             table.add_column("DB ID", style="dim", justify="right")
             table.add_column("Task Title (DB)")
             table.add_column("Change Field")
@@ -470,33 +526,110 @@ def sync_obsidian_changes(
             console.print(table)
 
             if not dry_run:
-                console.print("\n[bold]Applying detected status updates to the database...[/bold]")
-                if typer.confirm(f"Proceed with {len(potential_updates)} status updates to the database?", abort=True):
-                    applied_updates = 0
-                    failed_updates = 0
+                console.print("\n[bold]Applying detected updates to the database...[/bold]")
+                # Corrected confirmation message to reflect total field changes vs task count
+                unique_task_ids_to_update = len(set(pu['task_id'] for pu in potential_updates))
+                if typer.confirm(f"Proceed with {len(potential_updates)} potential field changes across {unique_task_ids_to_update} tasks?", abort=True):
+                    applied_changes_count = 0 # Counts individual field changes successfully applied
+                    tasks_updated_successfully_count = 0 # Counts tasks that had at least one successful change
+                    tasks_failed_to_update_count = 0   # Counts tasks where all proposed changes failed or task vanished
+
+                    # Group changes by task_id to make one update call per task
+                    changes_by_task_id: Dict[int, Dict[str, Any]] = {}
                     for update_info in potential_updates:
+                        task_id = update_info["task_id"]
+                        if task_id not in changes_by_task_id:
+                            changes_by_task_id[task_id] = {
+                                "update_payload": {},
+                                "original_task_title": update_info["db_title"] # For logging
+                            }
+
+                        change_type = update_info["change_type"]
+                        new_value = update_info["to_md_enum_or_dt"]
+
+                        if change_type == "status":
+                            changes_by_task_id[task_id]["update_payload"]["status"] = new_value
+                        elif change_type == "title":
+                            changes_by_task_id[task_id]["update_payload"]["title"] = new_value
+                        elif change_type == "due_dt":
+                            changes_by_task_id[task_id]["update_payload"]["due_dt"] = new_value
+
+                    processed_task_ids_for_summary = set()
+
+                    for task_id, task_changes_info in changes_by_task_id.items():
+                        update_payload = task_changes_info["update_payload"]
+                        original_task_title_for_log = task_changes_info["original_task_title"]
+
+                        task_update_succeeded_for_any_field = False
+
+                        # Fingerprint regeneration if title or due_dt changed
+                        if "title" in update_payload or "due_dt" in update_payload:
+                            db_task_to_update = crud.get_task(db, task_id)
+                            if not db_task_to_update:
+                                console.print(f"  [red]Error: Task ID {task_id} (Title: '{original_task_title_for_log}') not found in DB before update. Skipping.[/red]")
+                                if task_id not in processed_task_ids_for_summary : tasks_failed_to_update_count +=1
+                                processed_task_ids_for_summary.add(task_id)
+                                continue
+
+                            new_title_for_fp = update_payload.get("title", db_task_to_update.title)
+                            new_due_dt_for_fp = update_payload.get("due_dt")
+                            if "due_dt" not in update_payload:
+                                new_due_dt_for_fp = db_task_to_update.due_dt
+
+                            try:
+                                new_fingerprint = generate_task_fingerprint(new_title_for_fp, new_due_dt_for_fp)
+                                if new_fingerprint != db_task_to_update.fingerprint:
+                                    existing_task_with_new_fp = crud.get_task_by_fingerprint(db, new_fingerprint)
+                                    if existing_task_with_new_fp and existing_task_with_new_fp.id != task_id:
+                                        console.print(f"  [red]Error for Task ID {task_id} (Title: '{original_task_title_for_log}'): "
+                                                      f"Update would create a fingerprint collision with Task ID {existing_task_with_new_fp.id}. Update for this task aborted.[/red]")
+                                        if task_id not in processed_task_ids_for_summary : tasks_failed_to_update_count +=1
+                                        processed_task_ids_for_summary.add(task_id)
+                                        continue
+                                update_payload["fingerprint"] = new_fingerprint
+                            except ValueError as ve_fp:
+                                 console.print(f"  [red]Error generating fingerprint for Task ID {task_id} (Title: '{new_title_for_fp}'): {ve_fp}. Update for this task aborted.[/red]")
+                                 if task_id not in processed_task_ids_for_summary : tasks_failed_to_update_count +=1
+                                 processed_task_ids_for_summary.add(task_id)
+                                 continue
+
+                        # Apply the update
+                        if not update_payload: # Should not happen if potential_updates had items for this task_id
+                            if task_id not in processed_task_ids_for_summary : tasks_failed_to_update_count +=1 # Or just log as no-op
+                            processed_task_ids_for_summary.add(task_id)
+                            continue
+
                         try:
-                            updated_task = crud.update_task(
-                                db,
-                                task_id=update_info["task_id"],
-                                update_data={"status": update_info["to_md_enum"]}
-                            )
-                            if updated_task:
-                                console.print(f"  [green]Successfully updated Task ID {update_info['task_id']} status to {update_info['to_md_enum'].name}.[/green]")
-                                applied_updates += 1
-                            else:
-                                console.print(f"  [red]Failed to update Task ID {update_info['task_id']} - task not found by update_task (unexpected).[/red]")
-                                failed_updates += 1
+                            # Log what's being sent for update (excluding enums that are not str-friendly directly)
+                            loggable_payload = {k: (v.name if hasattr(v, 'name') else v) for k, v in update_payload.items()}
+                            console.print(f"  Updating Task ID {task_id} (Original Title: '{original_task_title_for_log}') with: {loggable_payload}")
+                            updated_task_obj = crud.update_task(db, task_id, update_payload)
+                            if updated_task_obj:
+                                console.print(f"    [green]Successfully updated Task ID {task_id}.[/green]")
+                                applied_changes_count += len(update_payload) # Count fields changed
+                                if task_id not in processed_task_ids_for_summary : tasks_updated_successfully_count +=1
+                                task_update_succeeded_for_any_field = True
+                            else: # crud.update_task returned None
+                                console.print(f"    [red]Failed to update Task ID {task_id} - crud.update_task returned None (task possibly deleted during sync?).[/red]")
+                                if task_id not in processed_task_ids_for_summary : tasks_failed_to_update_count +=1
                         except Exception as e_update:
-                            console.print(f"  [red]Error updating Task ID {update_info['task_id']} status: {e_update}[/red]")
-                            failed_updates += 1
+                            console.print(f"    [red]Error applying update for Task ID {task_id}: {e_update}[/red]")
+                            if task_id not in processed_task_ids_for_summary : tasks_failed_to_update_count +=1
+
+                        processed_task_ids_for_summary.add(task_id)
+
 
                     console.print(f"\n[bold green]Database update process complete.[/bold]")
-                    console.print(f"  Successfully applied: {applied_updates} updates.")
-                    if failed_updates > 0:
-                        console.print(f"  [bold red]Failed to apply: {failed_updates} updates.[/bold red]")
+                    console.print(f"  Updates applied for: {tasks_updated_successfully_count} tasks.")
+                    # Total individual field changes applied might be more interesting than tasks_updated_successfully_count
+                    # For now, tasks_updated_successfully_count means tasks for which at least one field was attempted to be updated and succeeded.
+                    # The initial applied_changes_count would be len(potential_updates) if all went well.
+                    # Let's refine summary based on successful `crud.update_task` calls rather than fields.
+                    console.print(f"  Total tasks with at least one successful change: {tasks_updated_successfully_count}")
+                    if tasks_failed_to_update_count > 0: # This counts tasks where all changes failed or task vanished
+                        console.print(f"  [bold red]Failed to apply any changes for: {tasks_failed_to_update_count} tasks.[/bold red]")
 
-        console.print(f"\nSync Summary: MD Tasks Processed: {md_tasks_processed}, DB Tasks Matched: {matched_tasks_count}, Potential Status Updates: {len(potential_updates)}, Matched with No Status Change: {no_status_change_count}")
+        console.print(f"\nSync Summary: MD Tasks Processed: {md_tasks_processed}, DB Tasks Matched: {matched_tasks_count}, Potential Updates (field changes): {len(potential_updates)}, Matched with No Change: {no_overall_change_count}")
 
     except typer.Abort:
         console.print("\n[yellow]Operation cancelled by user.[/yellow]")
