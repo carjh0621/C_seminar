@@ -38,24 +38,18 @@ class GmailAgent:
                 client_secret_from_db = db_token_record.client_secret # Might be None or sensitive
                 token_uri_from_db = db_token_record.token_uri
 
-                # If essential OAuth client details are not stored with the token, load from credentials_file
-                # This is common because client_secret is highly sensitive.
                 client_id_for_refresh = client_id_from_db
                 client_secret_for_refresh = client_secret_from_db
                 token_uri_for_refresh = token_uri_from_db or 'https://oauth2.googleapis.com/token'
 
-                if not client_id_for_refresh or not client_secret_for_refresh: # Or if preferring file for these
+                if not client_id_for_refresh or not client_secret_for_refresh:
                     if os.path.exists(self.credentials_file):
                         try:
                             with open(self.credentials_file, 'r') as f:
                                 client_config_json = json.load(f)
-                            # Determine if 'installed' or 'web' structure in credentials.json
-                            if 'installed' in client_config_json:
-                                config_key = 'installed'
-                            elif 'web' in client_config_json:
-                                config_key = 'web'
-                            else:
-                                config_key = None
+                            if 'installed' in client_config_json: config_key = 'installed'
+                            elif 'web' in client_config_json: config_key = 'web'
+                            else: config_key = None
 
                             if config_key:
                                 client_id_for_refresh = client_config_json[config_key].get('client_id', client_id_for_refresh)
@@ -65,7 +59,6 @@ class GmailAgent:
                             print(f"Error reading client_id/secret from {self.credentials_file}: {e}")
                     else:
                         print(f"Warning: {self.credentials_file} not found, cannot load client_id/secret for potential refresh if not in DB.")
-
 
                 if not client_id_for_refresh or not client_secret_for_refresh:
                     print("Client ID or Client Secret could not be determined for refresh. Refresh may fail if token is expired.")
@@ -77,7 +70,7 @@ class GmailAgent:
                     client_id=client_id_for_refresh,
                     client_secret=client_secret_for_refresh,
                     scopes=db_token_record.scopes.split(' ') if db_token_record.scopes else self.SCOPES,
-                    expiry=db_token_record.expires_dt # Assumes this is a UTC datetime object from DB
+                    expiry=db_token_record.expires_dt
                 )
                 print(f"Credentials reconstructed from DB for user '{app_user_id}'. Valid: {creds.valid}, Expired: {creds.expired}")
             else:
@@ -90,7 +83,6 @@ class GmailAgent:
             if creds and creds.expired and creds.refresh_token:
                 try:
                     print(f"Refreshing expired Gmail token for user '{app_user_id}'...")
-                    # Ensure creds has client_id, client_secret for refresh if they are required by Google's lib
                     if not creds.client_id or not creds.client_secret:
                          print("Warning: Client ID or Secret missing from reconstructed creds. Refresh might fail.")
                     creds.refresh(GoogleAuthRequest())
@@ -99,7 +91,7 @@ class GmailAgent:
                     print(f"Error refreshing Gmail token for '{app_user_id}': {e}. Proceeding to full re-auth.")
                     creds = None
 
-            if not creds: # No token in DB, or it was invalid/expired and refresh failed/not possible
+            if not creds:
                 if not os.path.exists(self.credentials_file):
                     print(f"OAuth credentials file '{self.credentials_file}' not found. Cannot initiate new auth flow.")
                     db.close()
@@ -119,15 +111,12 @@ class GmailAgent:
                     db.close()
                     return None
 
-            if creds: # If refresh succeeded or new flow succeeded
+            if creds:
                 try:
                     token_info_for_db = {
-                        'access_token': creds.token,
-                        'refresh_token': creds.refresh_token,
-                        'expires_dt': creds.expiry,
-                        'scopes': creds.scopes,
-                        'token_uri': creds.token_uri,
-                        'client_id': creds.client_id,
+                        'access_token': creds.token, 'refresh_token': creds.refresh_token,
+                        'expires_dt': creds.expiry, 'scopes': creds.scopes,
+                        'token_uri': creds.token_uri, 'client_id': creds.client_id,
                         'client_secret': creds.client_secret,
                     }
                     print(f"Attempting to save token for user '{app_user_id}', platform 'gmail' to DB.")
@@ -184,7 +173,6 @@ class GmailAgent:
     def fetch_messages(self, user_id='me', max_results=10, since_date_str=None):
         if not self.service:
             print("Gmail service not authenticated. Attempting to authenticate with default user...")
-            # This uses the default app_user_id="default_user" from authenticate_gmail
             if not self.authenticate_gmail():
                 print("Authentication failed. Cannot fetch messages.")
                 return []
@@ -193,7 +181,7 @@ class GmailAgent:
         query = None
         if since_date_str:
             try:
-                datetime.strptime(since_date_str, "%Y-%m-%d") # Validate format
+                datetime.strptime(since_date_str, "%Y-%m-%d")
                 query = f"after:{since_date_str.replace('-', '/')}"
             except ValueError:
                 print(f"Invalid since_date_str format: {since_date_str}. Ignoring date filter.")
@@ -232,30 +220,17 @@ class GmailAgent:
 
 if __name__ == '__main__':
     print("Testing GmailAgent with DB Token Storage...")
-    # For this test to run meaningfully, ensure your database is initialized
-    # and the SourceToken table exists with the new schema.
-    # You might need to run `python -m persistence.database` if you have a main block there
-    # that calls create_db_tables().
-    # from persistence.database import create_db_tables
-    # print("Ensuring database tables are created...")
-    # create_db_tables()
-
-    # Ensure credentials.json exists for the test.
-    # If it's the first time or token is invalid, this will trigger OAuth flow.
     if not os.path.exists('credentials.json'):
         print("FATAL: 'credentials.json' not found. Please set it up as per docs/gmail_setup.md")
-        # Exiting because dummy won't work with DB persistence properly for a real test.
     else:
         agent = GmailAgent(credentials_file='credentials.json')
-
-        test_app_user = "test_gmail_user_db_001" # Use a distinct user ID for DB testing
+        test_app_user = "test_gmail_user_db_001"
         print(f"Attempting authentication for user: {test_app_user}")
         gmail_service = agent.authenticate_gmail(app_user_id=test_app_user)
-
         if gmail_service:
             print(f"Authentication successful for {test_app_user}.")
             print("Fetching up to 2 recent emails...")
-            emails = agent.fetch_messages(max_results=2) # Uses the authenticated service
+            emails = agent.fetch_messages(max_results=2)
             if emails:
                 print(f"Successfully fetched {len(emails)} emails for {test_app_user}:")
                 for i, email_info in enumerate(emails):
@@ -266,3 +241,166 @@ if __name__ == '__main__':
             print(f"Authentication failed for {test_app_user}.")
             print("Ensure 'credentials.json' is valid and you've completed the OAuth flow if prompted.")
             print("Also check database connectivity and the SourceToken table schema.")
+
+# --- New Imports for KakaoAgent (Playwright) ---
+from playwright.sync_api import Playwright, BrowserContext, Page, Browser, Error as PlaywrightError
+from typing import List, Dict, Optional # Added for KakaoAgent type hints
+# --- End New Imports ---
+
+class KakaoAgent:
+    """
+    Agent for interacting with KakaoTalk using Playwright.
+    Note: Automating KakaoTalk can be challenging due to its structure
+    and potential for changes. This implementation will be experimental.
+    """
+    def __init__(self, playwright_instance: Playwright, user_data_dir: Optional[str] = None, headless: bool = False):
+        """
+        Initializes the KakaoAgent.
+
+        Args:
+            playwright_instance: An active Playwright object (from `with sync_playwright() as p:`).
+            user_data_dir: Optional path to a directory for persistent browser user data (for logins).
+            headless: Whether to run the browser in headless mode. Default is False for KakaoTalk.
+        """
+        self.pw_instance: Playwright = playwright_instance
+        self.user_data_dir: Optional[str] = user_data_dir
+        self.headless: bool = headless
+        self.browser: Optional[Browser] = None
+        self.context: Optional[BrowserContext] = None
+        self.page: Optional[Page] = None
+        print(f"KakaoAgent initialized. User data dir: {self.user_data_dir}, Headless: {self.headless}")
+
+
+    def login(self, timeout_ms: int = 60000) -> bool:
+        """
+        Launches a browser for KakaoTalk interaction.
+        This initial version relies on the user manually logging into their KakaoTalk PC client.
+        Playwright launches a browser that can be used for other web tasks, or potentially
+        to interact with a web-based Kakao interface if one is used/targeted in the future.
+        The primary goal here is to have a browser context ready.
+
+        Args:
+            timeout_ms: Maximum time to wait for page navigation (in milliseconds).
+
+        Returns:
+            True if browser setup is successful, False otherwise.
+        """
+        print(f"KakaoAgent: Initializing browser for KakaoTalk interaction.")
+        # Important Note on KakaoTalk PC Automation is in the class docstring / previous comments.
+
+        if self.context and self.page: # Check if already initialized
+            print("  Browser context and page already exist. Assuming active session.")
+            # Optionally, could try a quick self.page.url() or a lightweight check here.
+            return True
+
+        try:
+            launch_args_default = ['--disable-blink-features=AutomationControlled']
+            # Headless argument for chromium.launch is a boolean, not in args list directly for that.
+            # For launch_persistent_context, headless is a direct param, and args can supplement.
+
+            if self.user_data_dir:
+                print(f"  Launching persistent browser context using user_data_dir: {self.user_data_dir}")
+                self.context = self.pw_instance.chromium.launch_persistent_context(
+                    self.user_data_dir,
+                    headless=self.headless,
+                    args=launch_args_default,
+                    # viewport=None, # Let it use default or be set later if needed
+                    # no_viewport=True if self.headless else None # Use with caution, can affect layout
+                )
+                # For persistent context, self.browser is technically self.context.browser but we don't manage its lifecycle.
+                self.browser = None # Explicitly set to None as we don't "own" this browser lifecycle
+
+                if not self.context.pages():
+                    self.page = self.context.new_page()
+                else:
+                    self.page = self.context.pages[0]
+                print("  Persistent browser context launched.")
+            else:
+                print("  Launching new browser instance (non-persistent).")
+                self.browser = self.pw_instance.chromium.launch(headless=self.headless, args=launch_args_default)
+                self.context = self.browser.new_context(
+                    # viewport=None
+                )
+                self.page = self.context.new_page()
+                print("  New browser instance launched.")
+
+            if not self.page: # Should not happen if logic above is correct
+                print("  [Error] Page object was not created.")
+                self.close()
+                return False
+
+            print("  Navigating to a test page (google.com) to verify browser control...")
+            self.page.goto("https://google.com", timeout=timeout_ms // 2)
+            page_title = self.page.title() # Get title after navigation
+            print(f"  Successfully navigated to: {page_title}")
+
+            print("  Browser is ready. IMPORTANT: Please ensure KakaoTalk PC client is running and logged in manually.")
+            print("  KakaoAgent.login() successful (browser launched and test page loaded).")
+            return True
+
+        except PlaywrightError as e:
+            print(f"  Playwright error during KakaoAgent login/setup: {e}")
+            self.close()
+            return False
+        except Exception as e:
+            print(f"  Unexpected error during KakaoAgent login/setup: {e}")
+            self.close()
+            return False
+
+    def select_chat(self, chat_name: str, timeout_ms: int = 30000) -> bool:
+        print(f"KakaoAgent: Attempting to select chat: '{chat_name}' (timeout: {timeout_ms}ms)...")
+        if not self.page: print("  Error: Page not available. Login must be successful first."); return False
+        # TODO: Implement actual chat selection logic using Playwright
+        print(f"  [KakaoAgent.select_chat] Placeholder: Assuming chat '{chat_name}' selected. Returning True.")
+        return True
+
+    def read_messages(self, num_messages_to_capture: int = 20, scroll_attempts: int = 3) -> List[Dict]:
+        print(f"KakaoAgent: Reading messages (target: {num_messages_to_capture}, scrolls: {scroll_attempts})...")
+        if not self.page: print("  Error: Page not available. Chat must be selected first."); return []
+        # TODO: Implement actual message reading logic using Playwright
+        print(f"  [KakaoAgent.read_messages] Placeholder: Returning dummy messages.")
+        # Return 1 to 3 dummy messages for basic testing flow
+        return [{'id': f'kmsg_{i}', 'sender': 'DummySender' if i % 2 == 0 else 'MySelf',
+                 'timestamp_str': f'오후 1:{i:02d}',
+                 'text': f'This is dummy KakaoTalk message content {i}.'}
+                for i in range(1, min(num_messages_to_capture, 3) + 1)]
+
+    def close(self):
+        """
+        Closes the Playwright browser and context.
+        """
+        print("KakaoAgent: Closing browser resources...")
+        closed_something = False
+        if self.page:
+            try:
+                self.page.close()
+                self.page = None
+                closed_something = True
+                print("  Page closed.")
+            except Exception as e: print(f"  Error closing page: {e}")
+
+        if self.context:
+            try:
+                self.context.close()
+                self.context = None
+                closed_something = True
+                print("  Browser context closed.")
+            except Exception as e: print(f"  Error closing context: {e}")
+
+        # self.browser is primarily for non-persistent contexts.
+        # Persistent contexts manage their browser lifecycle implicitly when context is closed.
+        if self.browser:
+            try:
+                self.browser.close()
+                self.browser = None
+                closed_something = True
+                print("  Browser closed.")
+            except Exception as e: print(f"  Error closing browser: {e}")
+
+        if closed_something:
+            print("KakaoAgent: Browser resources released.")
+        else:
+            print("KakaoAgent: No active Playwright resources were explicitly closed by this agent instance (might be normal for persistent context if browser was pre-existing or if already closed).")
+
+# Example of __all__ if this file is treated as a package's __init__.py or for explicit exports
+# __all__ = ["GmailAgent", "KakaoAgent"]

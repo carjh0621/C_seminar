@@ -12,6 +12,7 @@ This project is an Agenda Manager that ingests data from various sources (initia
 *   Markdown Agenda Generation
 *   Scheduled Pipeline Runs (Daily)
 *   Telegram notifications for pipeline status (success/failure)
+*   KakaoTalk Ingestion (Experimental - Phase 1: Basic Setup Complete)
 
 ## Project Structure
 
@@ -37,7 +38,8 @@ This project is an Agenda Manager that ingests data from various sources (initia
 3.  **Configure Gmail API**: Follow the instructions in `docs/gmail_setup.md` to obtain `credentials.json` and place it in the project root.
 4.  **Configure OpenAI API Key**: Follow the instructions in `docs/llm_setup.md` to set up your OpenAI API key (preferably as an environment variable `OPENAI_API_KEY`).
 5.  **Configure Telegram Bot for Notifications**: Follow the instructions in `docs/telegram_setup.md` to set up your Telegram bot token and chat ID.
-6.  **Database**: The SQLite database (`agenda.db`) and its tables will be created automatically when you first run `main.py`.
+6.  **(Experimental)** Configure KakaoTalk Agent: See `docs/kakaotalk_setup.md`. This includes running `playwright install` for browser automation capabilities.
+7.  **Database**: The SQLite database (`agenda.db`) and its tables will be created automatically when you first run `main.py` (if running the scheduler) or via the CLI `initdb` command.
 
 ## Running the Application
 
@@ -174,10 +176,27 @@ python main.py cli list
    python main.py cli delete <TASK_ID>
    ```
 
+**8. Synchronize with Obsidian Markdown File (`sync`)**
+   Parses an Obsidian Markdown agenda file, matches tasks to the database, and synchronizes changes.
+   Currently, this command focuses on **syncing task status updates** (e.g., TODO, DONE, CANCELLED) from the Markdown file to the database.
+
+   ```bash
+   # Perform a dry-run (default) to see potential status changes
+   python main.py cli sync path/to/your/agenda.md
+
+   # Perform a live sync (applies status changes to DB after confirmation)
+   python main.py cli sync path/to/your/agenda.md --no-dry-run
+   ```
+   *   `filepath`: (Required argument) Path to your Markdown agenda file.
+   *   `--dry-run`: (Default: True) Show potential changes without modifying the database. Use `--no-dry-run` to enable applying changes.
+   *   When using `--no-dry-run`, you will be prompted for confirmation before any database updates are made.
+   *   The sync logic matches tasks based on normalized title and time. If a task's status in Markdown (e.g., `[x]`) differs from its status in the database, the command will propose and, if confirmed, apply the update.
+
 ---
 
 ## Future Enhancements (Conceptual)
-*   Support for more data sources (e.g., KakaoTalk, calendar).
+*   Full KakaoTalk message reading and task creation.
+*   Support for more data sources (e.g., other messengers, calendar APIs).
 *   Web interface / API for user interaction.
 *   More sophisticated de-duplication and conflict resolution.
 *   Notification system.
