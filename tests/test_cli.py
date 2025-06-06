@@ -401,3 +401,148 @@ class TestCliSyncCommands(unittest.TestCase):
     #     mock_find_match, mock_parse_md
     # ):
     #     pass
+
+    @patch('cli.main_cli.os.path.exists', return_value=True)
+    @patch('cli.main_cli.os.path.isfile', return_value=True)
+    @patch('cli.main_cli.parse_markdown_agenda_file')
+    @patch('cli.main_cli.find_matching_task_in_db')
+    @patch('cli.main_cli.crud')
+    @patch('cli.main_cli.SessionLocal')
+    @patch('typer.confirm')
+    def test_sync_obsidian_live_run_applies_status_changes_on_confirm(
+        self, mock_typer_confirm, MockSessionLocal, mock_crud_cli,
+        mock_find_match, mock_parse_md, mock_is_file, mock_path_exists # Patches are in reverse order of decorators
+    ):
+        mock_typer_confirm.return_value = True
+        mock_db_session = MagicMock()
+        MockSessionLocal.return_value = mock_db_session
+
+        md_tasks = [
+            {"date_str": "2024-01-01", "status_md": "[x]", "time_str": "10:00", "title_md": "MD Task 1 (Done in MD)", "tags_md": []},
+            {"date_str": "2024-01-01", "status_md": "[c]", "time_str": "11:00", "title_md": "MD Task 2 (Cancelled in MD)", "tags_md": []},
+        ]
+        mock_parse_md.return_value = md_tasks
+
+        # DB tasks with different initial statuses
+        db_task1 = Task(id=1, title="MD Task 1 (Done in MD)", status=TaskStatus.TODO, due_dt=datetime(2024,1,1,10,0), created_dt=datetime(2023,1,1), last_modified_dt=datetime(2023,1,1))
+        db_task2 = Task(id=2, title="MD Task 2 (Cancelled in MD)", status=TaskStatus.TODO, due_dt=datetime(2024,1,1,11,0), created_dt=datetime(2023,1,1), last_modified_dt=datetime(2023,1,1))
+
+        # Mock for the DB task fetching logic
+        if hasattr(mock_crud_cli, 'get_tasks_on_date'): # Check if the intended optimized crud exists
+            mock_crud_cli.get_tasks_on_date.return_value = [db_task1, db_task2]
+        else: # Fallback for current sync logic that uses get_tasks and filters
+            mock_crud_cli.get_tasks.return_value = [db_task1, db_task2]
+
+
+        def find_match_side_effect(parsed_md_task, db_tasks_on_date):
+            if parsed_md_task["title_md"] == "MD Task 1 (Done in MD)": return db_task1
+            if parsed_md_task["title_md"] == "MD Task 2 (Cancelled in MD)": return db_task2
+            return None
+        mock_find_match.side_effect = find_match_side_effect
+
+        # Mock the return of update_task to simulate successful update
+        def mock_update_task_effect(db, task_id, update_data):
+            # Return a dictionary or a mock Task object that looks like an updated task
+            # This helps format_task_details if it were called, though not strictly necessary for this test's asserts
+            updated_status = update_data["status"]
+            if task_id == 1:
+                return Task(id=1, title="MD Task 1 (Done in MD)", status=updated_status, due_dt=db_task1.due_dt, created_dt=db_task1.created_dt, last_modified_dt=datetime.utcnow())
+            if task_id == 2:
+                return Task(id=2, title="MD Task 2 (Cancelled in MD)", status=updated_status, due_dt=db_task2.due_dt, created_dt=db_task2.created_dt, last_modified_dt=datetime.utcnow())
+            return None # Should not happen if task_id is correct
+        mock_crud_cli.update_task.side_effect = mock_update_task_effect
+
+
+        result = runner.invoke(cli_app, ["sync", "dummy_path.md", "--no-dry-run"])
+
+        self.assertEqual(result.exit_code, 0, msg=f"CLI exited with errors: {result.stdout}")
+        mock_typer_confirm.assert_called_once()
+
+        self.assertEqual(mock_crud_cli.update_task.call_count, 2)
+        expected_calls = [
+            call(mock_db_session, task_id=1, update_data={"status": TaskStatus.DONE}),
+            call(mock_db_session, task_id=2, update_data={"status": TaskStatus.CANCELLED})
+        ]
+        mock_crud_cli.update_task.assert_has_calls(expected_calls, any_order=True)
+
+        self.assertIn("Successfully applied: 2 updates.", result.stdout)
+        self.assertIn("Database update process complete.", result.stdout)
+
+
+    @patch('cli.main_cli.os.path.exists', return_value=True)
+    @patch('cli.main_cli.os.path.isfile', return_value=True)
+    @patch('cli.main_cli.parse_markdown_agenda_file')
+    @patch('cli.main_cli.find_matching_task_in_db')
+    @patch('cli.main_cli.crud')
+    @patch('cli.main_cli.SessionLocal')
+    @patch('typer.confirm')
+    def test_sync_obsidian_live_run_user_cancels_update(
+        self, mock_typer_confirm, MockSessionLocal, mock_crud_cli,
+        mock_find_match, mock_parse_md, mock_is_file, mock_path_exists # Patches in reverse order
+    ):
+        mock_typer_confirm.return_value = False # User cancels (says 'no')
+        mock_db_session = MagicMock(); MockSessionLocal.return_value = mock_db_session
+
+        md_tasks = [{"date_str": "2024-01-01", "status_md": "[x]", "title_md": "MD Task 1", "tags_md": []}]
+        mock_parse_md.return_value = md_tasks
+
+        db_task1 = Task(id=1, title="MD Task 1", status=TaskStatus.TODO, due_dt=datetime(2024,1,1,10,0))
+        if hasattr(mock_crud_cli, 'get_tasks_on_date'):
+            mock_crud_cli.get_tasks_on_date.return_value = [db_task1]
+        else:
+            mock_crud_cli.get_tasks.return_value = [db_task1]
+        mock_find_match.return_value = db_task1
+
+        result = runner.invoke(cli_app, ["sync", "dummy_path.md", "--no-dry-run"])
+
+        self.assertEqual(result.exit_code, 1) # typer.confirm with abort=True exits with 1 if user says no
+        self.assertIn("Operation cancelled by user.", result.stdout)
+        mock_typer_confirm.assert_called_once()
+        mock_crud_cli.update_task.assert_not_called()
+
+    @patch('cli.main_cli.os.path.exists', return_value=True)
+    @patch('cli.main_cli.os.path.isfile', return_value=True)
+    @patch('cli.main_cli.parse_markdown_agenda_file')
+    @patch('cli.main_cli.find_matching_task_in_db')
+    @patch('cli.main_cli.crud')
+    @patch('cli.main_cli.SessionLocal')
+    @patch('typer.confirm', return_value=True)
+    def test_sync_obsidian_live_run_update_fails_for_one_task(
+        self, mock_typer_confirm, MockSessionLocal, mock_crud_cli,
+        mock_find_match, mock_parse_md, mock_is_file, mock_path_exists # Patches in reverse order
+    ):
+        mock_db_session = MagicMock(); MockSessionLocal.return_value = mock_db_session
+        md_tasks = [
+            {"date_str": "2024-01-01", "status_md": "[x]", "title_md": "Task Success", "tags_md": []},
+            {"date_str": "2024-01-01", "status_md": "[c]", "title_md": "Task Fail Update", "tags_md": []},
+        ]
+        mock_parse_md.return_value = md_tasks
+
+        db_task_ok = Task(id=1, title="Task Success", status=TaskStatus.TODO, due_dt=datetime(2024,1,1,10,0))
+        db_task_fail = Task(id=2, title="Task Fail Update", status=TaskStatus.TODO, due_dt=datetime(2024,1,1,11,0))
+        if hasattr(mock_crud_cli, 'get_tasks_on_date'):
+            mock_crud_cli.get_tasks_on_date.return_value = [db_task_ok, db_task_fail]
+        else:
+            mock_crud_cli.get_tasks.return_value = [db_task_ok, db_task_fail]
+
+        def find_match_side_effect(parsed_md_task, db_tasks_on_date):
+            if parsed_md_task["title_md"] == "Task Success": return db_task_ok
+            if parsed_md_task["title_md"] == "Task Fail Update": return db_task_fail
+            return None
+        mock_find_match.side_effect = find_match_side_effect
+
+        def update_task_side_effect(db, task_id, update_data):
+            if task_id == 1:
+                return Task(id=1, title="Task Success", status=update_data["status"])
+            if task_id == 2:
+                return None # Simulate failure to update task 2
+            return None
+        mock_crud_cli.update_task.side_effect = update_task_side_effect
+
+        result = runner.invoke(cli_app, ["sync", "dummy_path.md", "--no-dry-run"])
+
+        self.assertEqual(result.exit_code, 0, f"CLI sync (one fail) failed: {result.stdout}")
+        self.assertIn("Successfully applied: 1 updates.", result.stdout)
+        self.assertIn("Failed to apply: 1 updates.", result.stdout)
+        self.assertIn("Failed to update Task ID 2 - task not found by update_task", result.stdout)
+        self.assertEqual(mock_crud_cli.update_task.call_count, 2)

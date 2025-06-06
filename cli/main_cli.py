@@ -16,7 +16,7 @@ import os # For path operations
 # --- New imports for Obsidian Sync ---
 from obsidian_sync.parser import parse_markdown_agenda_file
 from obsidian_sync.matcher import find_matching_task_in_db
-from typing import Dict, List # For type hints in sync command
+from typing import Dict, List, Any # For type hints in sync command, added Any
 # --- End new imports ---
 # --- End Backend Logic Imports ---
 
@@ -363,14 +363,15 @@ def get_status_from_md_marker(status_md: str) -> TaskStatus | None:
     console.print(f"[dim]Unknown MD status marker: '{status_md}'[/dim]")
     return None
 
-@app.command(name="sync", help="Synchronize changes from an Obsidian Markdown agenda file (dry-run).")
+@app.command(name="sync", help="Synchronize task status changes from an Obsidian Markdown agenda file to the database.")
 def sync_obsidian_changes(
     filepath: Annotated[str, typer.Argument(help="Path to the Obsidian Markdown agenda file.")],
-    dry_run: Annotated[bool, typer.Option(help="Only show what changes would be made, do not write to DB.")] = True
+    dry_run: Annotated[bool, typer.Option(help="Show what changes would be made, without writing to DB.")] = True
 ):
     """
     Parses an Obsidian Markdown agenda file, matches tasks to the database,
-    and shows potential changes (currently, only status updates from MD to DB).
+    and applies status changes from Markdown to the database if not in dry-run mode.
+    Currently focuses on syncing task status (TODO, DONE, CANCELLED).
     """
     console.print(f"[bold cyan]Starting Obsidian Sync for file: {filepath}[/bold cyan]")
     if not os.path.exists(filepath) or not os.path.isfile(filepath):
@@ -379,6 +380,9 @@ def sync_obsidian_changes(
 
     if dry_run:
         console.print("[yellow]Running in DRY-RUN mode. No changes will be made to the database.[/yellow]")
+    else:
+        console.print("[bold yellow]WARNING: Running in LIVE mode. Database changes WILL be applied.[/bold yellow]")
+
 
     parsed_md_tasks = parse_markdown_agenda_file(filepath)
     if not parsed_md_tasks:
@@ -390,103 +394,114 @@ def sync_obsidian_changes(
     db_gen = get_db_session()
     db = next(db_gen)
 
+    # Stores dicts: {"task_id": ..., "db_title": ..., "change_type": "status",
+    #                "from_db_enum": TaskStatus, "to_md_enum": TaskStatus}
     potential_updates: List[Dict[str, Any]] = []
-    tasks_not_found_in_db_count = 0
-    tasks_found_but_no_change = 0
+
+    md_tasks_processed = 0
+    matched_tasks_count = 0
+    no_status_change_count = 0
 
     try:
-        # Efficiently fetch relevant DB tasks by grouping MD tasks by date first
-        md_tasks_grouped_by_date: Dict[str, List[Dict[str, Any]]] = {}
-        for md_task in parsed_md_tasks:
-            date_str = md_task.get("date_str")
-            if date_str:
-                md_tasks_grouped_by_date.setdefault(date_str, []).append(md_task)
+        md_dates_str = sorted(list(set(md_task['date_str'] for md_task in parsed_md_tasks if md_task['date_str'])))
+        db_tasks_by_date_map: Dict[str, List[Task]] = {} # Cache DB tasks per date
 
-        for date_str, md_task_list_on_date in md_tasks_grouped_by_date.items():
+        for date_str_to_fetch in md_dates_str:
             try:
-                date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
+                date_obj = datetime.strptime(date_str_to_fetch, "%Y-%m-%d").date()
+                # Try to use a specific CRUD function if available, otherwise fallback
+                if hasattr(crud, 'get_tasks_on_date'):
+                    db_tasks_by_date_map[date_str_to_fetch] = crud.get_tasks_on_date(db, target_date=date_obj) # type: ignore
+                else: # Fallback if crud.get_tasks_on_date is not implemented
+                    if not hasattr(crud, '_warned_get_tasks_on_date'): # Print warning only once
+                        console.print(f"[yellow]Developer Note: crud.get_tasks_on_date not found, using inefficient fallback for fetching DB tasks by date.[/yellow]")
+                        crud._warned_get_tasks_on_date = True # type: ignore
+                    all_db_tasks = crud.get_tasks(db, limit=10000)
+                    db_tasks_by_date_map[date_str_to_fetch] = [t for t in all_db_tasks if t.due_dt and t.due_dt.date() == date_obj]
             except ValueError:
-                console.print(f"[yellow]Warning: Invalid date string '{date_str}' from MD parser. Skipping tasks for this date.[/yellow]")
-                continue
+                console.print(f"[yellow]Warning: Invalid date string '{date_str_to_fetch}' from MD. Skipping tasks for this date.[/yellow]")
+                db_tasks_by_date_map[date_str_to_fetch] = []
 
-            # Fetch DB tasks for this specific date once
-            # This assumes crud.get_tasks can be modified or a new function like crud.get_tasks_on_date exists
-            # For now, using a conceptual filter on all tasks (inefficient for large DBs)
-            # console.print(f"[dim]Fetching DB tasks for date: {date_str}...[/dim]")
-            all_db_tasks_on_date = [
-                t for t in crud.get_tasks(db, limit=10000) # TODO: Optimize DB query
-                if t.due_dt and t.due_dt.date() == date_obj
-            ]
-            # console.print(f"[dim]Found {len(all_db_tasks_on_date)} DB tasks for {date_str}.[/dim]")
+        for md_task in parsed_md_tasks:
+            md_tasks_processed +=1
+            md_date_str = md_task.get("date_str")
+            if not md_date_str: continue
 
+            db_tasks_on_this_date = db_tasks_by_date_map.get(md_date_str, [])
+            matched_db_task = find_matching_task_in_db(md_task, db_tasks_on_this_date)
 
-            for md_task in md_task_list_on_date:
-                matched_db_task = find_matching_task_in_db(md_task, all_db_tasks_on_date)
+            if matched_db_task:
+                matched_tasks_count += 1
+                md_status_str = md_task.get("status_md")
+                md_status_enum = get_status_from_md_marker(md_status_str) if md_status_str else None
 
-                if matched_db_task:
-                    md_status_str = md_task.get("status_md")
-                    md_status_enum = get_status_from_md_marker(md_status_str) if md_status_str else None
-
-                    if md_status_enum and matched_db_task.status != md_status_enum:
-                        potential_updates.append({
-                            "task_id": matched_db_task.id,
-                            "db_title": matched_db_task.title,
-                            "change_type": "status",
-                            "from_db": matched_db_task.status.name if matched_db_task.status else "N/A",
-                            "to_md": md_status_enum.name
-                        })
-                    else:
-                        tasks_found_but_no_change +=1
-                        # console.print(f"[dim]MD Task '{md_task.get('title_md')}' matched DB Task ID {matched_db_task.id}. No status change needed.[/dim]")
-
-                    # Conceptual: Add more comparisons here (title, due_dt, tags) if needed for Phase 2
+                if md_status_enum and matched_db_task.status != md_status_enum:
+                    potential_updates.append({
+                        "task_id": matched_db_task.id,
+                        "db_title": matched_db_task.title,
+                        "change_type": "status",
+                        "from_db_enum": matched_db_task.status,
+                        "to_md_enum": md_status_enum
+                    })
                 else:
-                    tasks_not_found_in_db_count +=1
-                    # console.print(f"[dim]MD Task '{md_task.get('title_md')}' on {date_str} - No unique DB match found.[/dim]")
+                    no_status_change_count +=1
 
-        console.print(f"Processed {len(parsed_md_tasks)} MD tasks. {len(potential_updates)} potential status changes.")
-        if tasks_not_found_in_db_count > 0:
-            console.print(f"[yellow]{tasks_not_found_in_db_count} MD tasks could not be matched to DB tasks.[/yellow]")
-        if tasks_found_but_no_change > 0:
-            console.print(f"[dim]{tasks_found_but_no_change} MD tasks matched DB tasks with no status difference.[/dim]")
-
-
+        # --- Reporting and Applying Changes ---
         if not potential_updates:
-            if tasks_not_found_in_db_count == 0 : # Only print this if there were also no unmatched tasks
-                 console.print("[green]No differences found between Markdown file and database tasks (for status).[/green]")
+            console.print("[green]No status differences found between Markdown file and database tasks.[/green]")
         else:
-            console.print(f"\n[bold yellow]Detected {len(potential_updates)} potential status updates (Dry Run):[/bold yellow]")
-            table = Table(title="Potential Task Status Updates (Dry Run)")
+            title_suffix = "(Dry Run)" if dry_run else "(Live Run - Pending Confirmation)"
+            console.print(f"\n[bold yellow]Detected {len(potential_updates)} potential status updates {title_suffix}:[/bold yellow]")
+            table = Table(title=f"Potential Task Status Updates {title_suffix}")
             table.add_column("DB ID", style="dim", justify="right")
             table.add_column("Task Title (DB)")
             table.add_column("Change Field")
-            table.add_column("From (DB Value)")
-            table.add_column("To (MD Value)")
+            table.add_column("From (DB Status)")
+            table.add_column("To (MD Status)")
 
-            for update in potential_updates:
+            for update_info in potential_updates:
                 table.add_row(
-                    str(update["task_id"]),
-                    update["db_title"],
-                    update["change_type"],
-                    update["from_db"],
-                    update["to_md"]
+                    str(update_info["task_id"]),
+                    update_info["db_title"],
+                    update_info["change_type"],
+                    update_info["from_db_enum"].name if update_info["from_db_enum"] else "N/A",
+                    update_info["to_md_enum"].name if update_info["to_md_enum"] else "N/A"
                 )
             console.print(table)
 
             if not dry_run:
-                console.print("\n[INFO] Actual database updates for 'sync' command not yet implemented.", style="yellow")
-                # TODO: Implement actual DB updates in Phase 2
-                # if typer.confirm("Proceed with these status updates to the database?"):
-                #    for update_item in potential_updates:
-                #        if update_item['change_type'] == 'status':
-                #            new_status_enum = TaskStatus[update_item['to_md']]
-                #            crud.update_task(db, update_item['task_id'], {"status": new_status_enum})
-                #    console.print("[green]Database updated with status changes.[/green]")
-                # else:
-                #    console.print("Database update cancelled by user.")
+                console.print("\n[bold]Applying detected status updates to the database...[/bold]")
+                if typer.confirm(f"Proceed with {len(potential_updates)} status updates to the database?", abort=True):
+                    applied_updates = 0
+                    failed_updates = 0
+                    for update_info in potential_updates:
+                        try:
+                            updated_task = crud.update_task(
+                                db,
+                                task_id=update_info["task_id"],
+                                update_data={"status": update_info["to_md_enum"]}
+                            )
+                            if updated_task:
+                                console.print(f"  [green]Successfully updated Task ID {update_info['task_id']} status to {update_info['to_md_enum'].name}.[/green]")
+                                applied_updates += 1
+                            else:
+                                console.print(f"  [red]Failed to update Task ID {update_info['task_id']} - task not found by update_task (unexpected).[/red]")
+                                failed_updates += 1
+                        except Exception as e_update:
+                            console.print(f"  [red]Error updating Task ID {update_info['task_id']} status: {e_update}[/red]")
+                            failed_updates += 1
 
+                    console.print(f"\n[bold green]Database update process complete.[/bold]")
+                    console.print(f"  Successfully applied: {applied_updates} updates.")
+                    if failed_updates > 0:
+                        console.print(f"  [bold red]Failed to apply: {failed_updates} updates.[/bold red]")
+
+        console.print(f"\nSync Summary: MD Tasks Processed: {md_tasks_processed}, DB Tasks Matched: {matched_tasks_count}, Potential Status Updates: {len(potential_updates)}, Matched with No Status Change: {no_status_change_count}")
+
+    except typer.Abort:
+        console.print("\n[yellow]Operation cancelled by user.[/yellow]")
     except Exception as e:
         console.print(f"[bold red]An error occurred during sync process: {e}[/bold red]")
-        # import traceback; traceback.print_exc(); # For debugging full trace
+        # import traceback; traceback.print_exc(); # For debugging
     finally:
-        next(db_gen, None) # Ensure session is closed
+        next(db_gen, None)
