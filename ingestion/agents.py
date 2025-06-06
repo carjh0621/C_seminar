@@ -348,22 +348,145 @@ class KakaoAgent:
             return False
 
     def select_chat(self, chat_name: str, timeout_ms: int = 30000) -> bool:
-        print(f"KakaoAgent: Attempting to select chat: '{chat_name}' (timeout: {timeout_ms}ms)...")
-        if not self.page: print("  Error: Page not available. Login must be successful first."); return False
-        # TODO: Implement actual chat selection logic using Playwright
-        print(f"  [KakaoAgent.select_chat] Placeholder: Assuming chat '{chat_name}' selected. Returning True.")
-        return True
+        method_name = "KakaoAgent.select_chat"
+        print(f"{method_name}: Attempting to select chat: '{chat_name}' (timeout: {timeout_ms}ms)...")
+
+        if not self.page:
+            print(f"Error ({method_name}): Page object not available. Login must be successful first.")
+            return False
+
+        # --- CONCEPTUAL SELECTOR ---
+        # This needs to be replaced with actual selectors from KakaoTalk DOM inspection.
+        # Using Playwright's role and text based locator as a robust example.
+        print(f"  ({method_name}): Using conceptual locator strategy (get_by_role 'listitem', name='{chat_name}').")
+
+        try:
+            # Attempt to find a list item (common for chat lists) that has the specified name (aria-label or text content).
+            # .first is used if multiple items might match the role but the name makes it specific.
+            chat_item_locator = self.page.get_by_role("listitem", name=chat_name).first
+
+            print(f"  ({method_name}): Attempting to click chat item '{chat_name}'...")
+            # Default timeout for click is often sufficient if element is readily available.
+            # Can specify timeout: chat_item_locator.click(timeout=timeout_ms)
+            chat_item_locator.click(timeout=timeout_ms)
+
+            # TODO: Add a verification step after clicking to confirm the chat opened.
+            # This is crucial for robust automation.
+            # Example (conceptual):
+            # active_chat_header_locator = self.page.locator(f"header[data-testid='active-chat-title']:has-text('{chat_name}')")
+            # active_chat_header_locator.wait_for(state='visible', timeout=5000) # Wait for header to be visible
+
+            print(f"Success ({method_name}): Clicked on chat item '{chat_name}'. (Post-click verification needed).")
+            return True
+
+        except PlaywrightError as e:
+            # This can catch various Playwright-specific errors, including timeout errors if element not found.
+            print(f"Error ({method_name}): Playwright error selecting chat '{chat_name}' (e.g., element not found or timeout): {e}")
+            return False
+        except Exception as e:
+            # Catch any other unexpected errors during the process.
+            print(f"Error ({method_name}): Unexpected error while selecting chat '{chat_name}': {e}")
+            return False
 
     def read_messages(self, num_messages_to_capture: int = 20, scroll_attempts: int = 3) -> List[Dict]:
-        print(f"KakaoAgent: Reading messages (target: {num_messages_to_capture}, scrolls: {scroll_attempts})...")
-        if not self.page: print("  Error: Page not available. Chat must be selected first."); return []
-        # TODO: Implement actual message reading logic using Playwright
-        print(f"  [KakaoAgent.read_messages] Placeholder: Returning dummy messages.")
-        # Return 1 to 3 dummy messages for basic testing flow
-        return [{'id': f'kmsg_{i}', 'sender': 'DummySender' if i % 2 == 0 else 'MySelf',
-                 'timestamp_str': f'오후 1:{i:02d}',
-                 'text': f'This is dummy KakaoTalk message content {i}.'}
-                for i in range(1, min(num_messages_to_capture, 3) + 1)]
+    def read_messages(self, num_messages_to_capture: int = 20, scroll_attempts: int = 0) -> List[Dict]:
+        """
+        Reads messages from the currently selected chat using Playwright.
+        Uses CONCEPTUAL selectors that need to be replaced with actual ones.
+        Initial version focuses on visible messages; scrolling is a TODO.
+
+        Args:
+            num_messages_to_capture: Target number of recent messages to try to capture.
+                                     (Currently will fetch visible, up to this number)
+            scroll_attempts: Number of times to scroll up (Not implemented in this version).
+
+        Returns:
+            A list of dictionaries, each representing a message.
+            Example: {'id': 'k_...', 'sender': 'SenderName',
+                      'timestamp_str': '오후 3:45', 'text': 'Message content'}
+        """
+        method_name = "KakaoAgent.read_messages"
+        print(f"{method_name}: Reading up to {num_messages_to_capture} messages...")
+
+        if not self.page:
+            print(f"Error ({method_name}): Page object not available. A chat must be selected first.")
+            return []
+
+        if scroll_attempts > 0:
+            print(f"  Info ({method_name}): Scrolling ({scroll_attempts} attempts) is not yet implemented. Reading visible messages only.")
+            # TODO: Implement scrolling logic here in the future.
+            # For example:
+            # for _ in range(scroll_attempts):
+            #     self.page.keyboard.press("PageUp") # Or mouse wheel scroll on message container
+            #     self.page.wait_for_timeout(500) # Wait for content to load
+
+        messages: List[Dict] = []
+
+        # --- CONCEPTUAL SELECTORS for message components ---
+        # These need to be replaced with actual selectors from KakaoTalk DOM inspection.
+        # Example: message_elements_locator = self.page.locator("div.chat_message_bubble")
+        message_elements_locator = self.page.locator("div[role='listitem'][aria-label*='message']") # Conceptual: finds message list items
+
+        print(f"  ({method_name}): Attempting to locate message elements using conceptual selector...")
+
+        try:
+            # Fetch all currently visible/DOM-rendered message elements matching the locator
+            visible_message_elements = message_elements_locator.all() # Gets all current matches as Locator list
+            print(f"  ({method_name}): Found {len(visible_message_elements)} potential message elements in DOM.")
+
+            # Process messages, typically from bottom up (most recent) if that's how they appear in DOM
+            # Slicing to get the last num_messages_to_capture elements
+            elements_to_process = visible_message_elements[-num_messages_to_capture:]
+
+            for i, msg_element_locator in enumerate(elements_to_process):
+                # msg_element_locator is now a Playwright Locator for a single message element
+                print(f"  ({method_name}): Processing message element {i+1}...")
+                try:
+                    # Conceptual sub-selectors relative to the msg_element_locator
+                    # These data-testid attributes are purely examples.
+                    sender_locator = msg_element_locator.locator("span[data-testid='sender']")
+                    text_locator = msg_element_locator.locator("div[data-testid='message-text']")
+                    timestamp_locator = msg_element_locator.locator("span[data-testid='timestamp']")
+
+                    sender = sender_locator.text_content(timeout=500) if sender_locator.count() > 0 else "Unknown Sender"
+                    text = text_locator.text_content(timeout=500) if text_locator.count() > 0 else ""
+                    timestamp_str = timestamp_locator.text_content(timeout=500) if timestamp_locator.count() > 0 else "Unknown Time"
+
+                    sender = sender.strip()
+                    text = text.strip()
+                    timestamp_str = timestamp_str.strip()
+
+                    if not text and sender == "Unknown Sender": # Skip if no text and sender is also unknown
+                        print(f"    ({method_name}): Skipping message with empty text and unknown sender.")
+                        continue
+
+                    # Generate a simple ID (can be improved with more message metadata if available)
+                    msg_id_str = f"{sender}_{timestamp_str}_{text[:20]}" # Use first 20 chars of text for hash
+                    msg_id = f"k_{hashlib.sha1(msg_id_str.encode('utf-8')).hexdigest()[:10]}"
+
+                    messages.append({
+                        'id': msg_id,
+                        'sender': sender,
+                        'timestamp_str': timestamp_str,
+                        'text': text
+                    })
+                    print(f"    ({method_name}): Extracted: Sender='{sender}', Time='{timestamp_str}', Text='{text[:30].replace(chr(10), ' ')}...'")
+
+                except PlaywrightError as e_msg:
+                    print(f"  Warning ({method_name}): Playwright error extracting details for a message: {e_msg}")
+                except Exception as e_u:
+                    print(f"  Warning ({method_name}): Unexpected error extracting details for a message: {e_u}")
+
+            print(f"  ({method_name}): Successfully extracted {len(messages)} messages.")
+
+        except PlaywrightError as e:
+            print(f"Error ({method_name}): Playwright error locating message list or messages: {e}")
+            return []
+        except Exception as e:
+            print(f"Error ({method_name}): Unexpected error reading messages: {e}")
+            return []
+
+        return messages
 
     def close(self):
         """

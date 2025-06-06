@@ -408,3 +408,133 @@ class TestKakaoAgent(unittest.TestCase):
         self.assertIsNone(self.agent.page)
         self.assertIsNone(self.agent.context)
         self.assertIsNone(self.agent.browser)
+
+    def test_select_chat_success(self):
+        self.agent.page = self.mock_page # Ensure page is set for the test
+
+        # Mock the locator chain for finding the chat item
+        mock_chat_item_locator = MagicMock(spec=Locator)
+        # Configure self.mock_page.get_by_role(...).first to return our specific locator mock
+        self.mock_page.get_by_role.return_value.first = mock_chat_item_locator
+
+        success = self.agent.select_chat("Test Chat", timeout_ms=1000)
+
+        self.assertTrue(success)
+        # Verify get_by_role was called correctly
+        self.mock_page.get_by_role.assert_called_once_with("listitem", name="Test Chat")
+        # Verify click was called on the locator returned by .first
+        mock_chat_item_locator.click.assert_called_once_with(timeout=1000)
+
+    def test_select_chat_not_found_timeout(self):
+        self.agent.page = self.mock_page
+
+        mock_chat_item_locator = MagicMock(spec=Locator)
+        mock_chat_item_locator.click.side_effect = PlaywrightError("Timeout waiting for element")
+        self.mock_page.get_by_role.return_value.first = mock_chat_item_locator
+
+        success = self.agent.select_chat("NonExistentChat", timeout_ms=500)
+
+        self.assertFalse(success)
+        self.mock_page.get_by_role.assert_called_once_with("listitem", name="NonExistentChat")
+        mock_chat_item_locator.click.assert_called_once_with(timeout=500)
+
+    def test_select_chat_no_page_available(self): # Already present from previous step, verified
+        self.agent.page = None # Simulate no page (login failed)
+        success = self.agent.select_chat("AnyChat")
+        self.assertFalse(success)
+
+    def test_read_messages_success(self):
+        self.agent.page = self.mock_page
+
+        # Create mock Locator objects for individual message elements
+        mock_msg_element1 = MagicMock(spec=Locator)
+        mock_msg_element2 = MagicMock(spec=Locator)
+
+        # Configure the main locator for message elements to return these mocks
+        self.mock_page.locator.return_value.all.return_value = [mock_msg_element1, mock_msg_element2]
+
+        # Configure sub-locators and their text_content for Message 1
+        # Ensure the sub-locator calls on mock_msg_element1 return distinct mocks for .locator()
+        mock_sender_loc1 = MagicMock(spec=Locator); mock_sender_loc1.text_content.return_value = "Alice"; mock_sender_loc1.count.return_value = 1
+        mock_text_loc1 = MagicMock(spec=Locator); mock_text_loc1.text_content.return_value = "Hello Bob"; mock_text_loc1.count.return_value = 1
+        mock_ts_loc1 = MagicMock(spec=Locator); mock_ts_loc1.text_content.return_value = "오후 1:00"; mock_ts_loc1.count.return_value = 1
+
+        def msg1_locator_side_effect(selector):
+            if selector == "span[data-testid='sender']": return mock_sender_loc1
+            if selector == "div[data-testid='message-text']": return mock_text_loc1
+            if selector == "span[data-testid='timestamp']": return mock_ts_loc1
+            return MagicMock(spec=Locator, count=0) # Default for unexpected selectors
+        mock_msg_element1.locator.side_effect = msg1_locator_side_effect
+
+        # Configure sub-locators and their text_content for Message 2
+        mock_sender_loc2 = MagicMock(spec=Locator); mock_sender_loc2.text_content.return_value = "Bob"; mock_sender_loc2.count.return_value = 1
+        mock_text_loc2 = MagicMock(spec=Locator); mock_text_loc2.text_content.return_value = "Hi Alice"; mock_text_loc2.count.return_value = 1
+        mock_ts_loc2 = MagicMock(spec=Locator); mock_ts_loc2.text_content.return_value = "오후 1:01"; mock_ts_loc2.count.return_value = 1
+
+        def msg2_locator_side_effect(selector):
+            if selector == "span[data-testid='sender']": return mock_sender_loc2
+            if selector == "div[data-testid='message-text']": return mock_text_loc2
+            if selector == "span[data-testid='timestamp']": return mock_ts_loc2
+            return MagicMock(spec=Locator, count=0)
+        mock_msg_element2.locator.side_effect = msg2_locator_side_effect
+
+        messages = self.agent.read_messages(num_messages_to_capture=2)
+
+        self.assertEqual(len(messages), 2)
+        # Check main locator call
+        self.mock_page.locator.assert_called_with("div[role='listitem'][aria-label*='message']")
+
+        # Check details of first message
+        self.assertEqual(messages[0]['sender'], "Alice")
+        self.assertEqual(messages[0]['text'], "Hello Bob")
+        self.assertEqual(messages[0]['timestamp_str'], "오후 1:00")
+        self.assertTrue(messages[0]['id'].startswith("k_"))
+
+        # Check details of second message
+        self.assertEqual(messages[1]['sender'], "Bob")
+        self.assertEqual(messages[1]['text'], "Hi Alice")
+        self.assertEqual(messages[1]['timestamp_str'], "오후 1:01")
+
+        # Verify calls to sub-locators for message 1
+        mock_msg_element1.locator.assert_any_call("span[data-testid='sender']")
+        mock_msg_element1.locator.assert_any_call("div[data-testid='message-text']")
+        mock_msg_element1.locator.assert_any_call("span[data-testid='timestamp']")
+
+        # Verify calls to sub-locators for message 2
+        mock_msg_element2.locator.assert_any_call("span[data-testid='sender']")
+        mock_msg_element2.locator.assert_any_call("div[data-testid='message-text']")
+        mock_msg_element2.locator.assert_any_call("span[data-testid='timestamp']")
+
+
+    def test_read_messages_locating_message_list_fails(self):
+        self.agent.page = self.mock_page
+        self.mock_page.locator.return_value.all.side_effect = PlaywrightError("Cannot find message list container")
+
+        messages = self.agent.read_messages()
+        self.assertEqual(messages, [])
+
+    def test_read_messages_no_page_available(self): # Already present, verified
+        self.agent.page = None
+        messages = self.agent.read_messages()
+        self.assertEqual(messages, [])
+
+    def test_read_messages_partial_extraction_failure(self):
+        self.agent.page = self.mock_page
+
+        mock_msg_element_fail = MagicMock(spec=Locator)
+        self.mock_page.locator.return_value.all.return_value = [mock_msg_element_fail]
+
+        mock_sender_loc = MagicMock(spec=Locator); mock_sender_loc.text_content.return_value = "Charlie"; mock_sender_loc.count.return_value = 1
+        mock_text_loc_fail = MagicMock(spec=Locator); mock_text_loc_fail.text_content.side_effect = PlaywrightError("Cannot get text"); mock_text_loc_fail.count.return_value = 1 # text_content fails
+        mock_ts_loc = MagicMock(spec=Locator); mock_ts_loc.text_content.return_value = "오후 3:00"; mock_ts_loc.count.return_value = 1
+
+        def msg_fail_locator_side_effect(selector):
+            if selector == "span[data-testid='sender']": return mock_sender_loc
+            if selector == "div[data-testid='message-text']": return mock_text_loc_fail
+            if selector == "span[data-testid='timestamp']": return mock_ts_loc
+            return MagicMock(spec=Locator, count=0)
+        mock_msg_element_fail.locator.side_effect = msg_fail_locator_side_effect
+
+        messages = self.agent.read_messages(num_messages_to_capture=1)
+
+        self.assertEqual(len(messages), 0, "Message with partial extraction failure should be skipped.")
