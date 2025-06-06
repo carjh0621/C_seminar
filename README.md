@@ -177,20 +177,29 @@ python main.py cli list
    ```
 
 **8. Synchronize with Obsidian Markdown File (`sync`)**
-   Parses an Obsidian Markdown agenda file, matches tasks to the database, and synchronizes changes.
-   Currently, this command focuses on **syncing task status updates** (e.g., TODO, DONE, CANCELLED) from the Markdown file to the database.
+   Parses an Obsidian Markdown agenda file, matches tasks to the database, and synchronizes detected changes from Markdown to the database.
+   This command can sync changes to **task status, title, and due date**.
 
    ```bash
-   # Perform a dry-run (default) to see potential status changes
+   # Perform a dry-run (default) to see all potential changes (status, title, due date)
    python main.py cli sync path/to/your/agenda.md
 
-   # Perform a live sync (applies status changes to DB after confirmation)
+   # Perform a live sync (applies all detected changes to DB after confirmation)
    python main.py cli sync path/to/your/agenda.md --no-dry-run
    ```
    *   `filepath`: (Required argument) Path to your Markdown agenda file.
    *   `--dry-run`: (Default: True) Show potential changes without modifying the database. Use `--no-dry-run` to enable applying changes.
-   *   When using `--no-dry-run`, you will be prompted for confirmation before any database updates are made.
-   *   The sync logic matches tasks based on normalized title and time. If a task's status in Markdown (e.g., `[x]`) differs from its status in the database, the command will propose and, if confirmed, apply the update.
+   *   **How it works**:
+        *   The command parses tasks from your Markdown file (including their status `[ ]`, `[x]`, `[c]`, title, and time).
+        *   It attempts to match these tasks with existing tasks in the database based on a normalized version of the title and the task's time (or lack thereof for all-day tasks) on a given date.
+        *   **For matched tasks, it detects differences in:**
+            *   **Status**: e.g., if `[ ] Task A` in Markdown corresponds to a "DONE" Task A in the database.
+            *   **Title**: If the text of the task in Markdown (after normalization) differs from the normalized title in the database.
+            *   **Due Date/Time**: If the time specified in Markdown (e.g., `10:30 Task B`) or the date of the section for an all-day task differs from the `due_dt` in the database. The parser attempts to re-interpret the due date from the Markdown line.
+        *   If you run a live sync (`--no-dry-run`):
+            *   You will be shown a summary of all proposed changes (status, title, due date) and asked for confirmation before any modifications are made to the database.
+            *   If confirmed, the database tasks will be updated with the values from the Markdown file.
+            *   **Fingerprint Handling**: If a change to a task's title or due date results in a new "fingerprint" (a unique identifier based on normalized title and due date), the system checks if this new fingerprint would collide with a *different existing* task. If a collision is detected, the update for that specific task will be skipped to prevent creating data that looks like a duplicate of another existing entry.
 
 ---
 
