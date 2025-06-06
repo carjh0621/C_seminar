@@ -33,22 +33,30 @@
         ```
     *   The `KakaoAgent`'s `__init__` method takes a `user_data_dir` argument. If you plan to use this, you would pass the configured path when instantiating the agent.
 
-3.  **Target Chat Room Name (for future use)**:
-    *   For future functionality where the agent reads messages, you will need to specify the exact display name of the KakaoTalk chat room you want the agent to monitor. This would typically be set in `config.py`:
+3.  **Target Chat Room Name**:
+    *   You need to specify the exact display name of the KakaoTalk chat room you want the agent to monitor. This is set in `config.py` via the `KAKAOTALK_CHAT_NAME_TO_MONITOR` variable.
         ```python
-        # Example in config.py (conceptual for now)
-        # KAKAOTALK_CHAT_NAME_TO_MONITOR = "Your Target Chat Room Name"
+        # In config.py
+        KAKAOTALK_CHAT_NAME_TO_MONITOR = "Your Target Chat Room Name"
         ```
-        For example, many users have a "chat with myself" (나와의 채팅) which can be used for sending notes or links to oneself.
+    *   This name is used by the `KakaoAgent` when it attempts to select the chat room for reading messages. Ensure it exactly matches what you see in your KakaoTalk client (case-sensitive).
 
-## How it Currently Works (Initial Phase)
+## Current Agent Capabilities (Experimental - Phase 2 Development)
 
-*   When the `KakaoAgent`'s `login()` method is called:
-    *   It launches a new Chromium browser instance controlled by Playwright (or attempts to reuse/create a persistent browser context if `user_data_dir` is specified and implemented).
-    *   It navigates this Playwright-controlled browser to a generic page (e.g., google.com) to confirm that the browser instance is operational under Playwright's control.
-    *   **Crucially, it does NOT automatically log into your KakaoTalk PC client or directly interact with it at this stage.**
-*   You, the user, are responsible for ensuring your KakaoTalk PC client is already running and logged in independently of the Playwright-launched browser.
-*   Subsequent methods like `select_chat()` and `read_messages()` (which are currently placeholders) would be where the experimental logic to interact with KakaoTalk's UI (if it uses web-renderable components accessible to Playwright, or via OS-level GUI automation as a fallback strategy) would reside. This interaction is complex and highly dependent on KakaoTalk's application architecture.
+The `KakaoAgent` is under active development. The current capabilities are:
+
+*   **Browser Launch & Manual Login**:
+    *   The `login()` method launches a Playwright-controlled Chromium browser.
+    *   It still **requires you to manually ensure your KakaoTalk PC client is running and logged in.** The agent does not automate the KakaoTalk PC login itself.
+*   **Chat Selection (Conceptual)**:
+    *   The `select_chat(chat_name)` method contains logic to *attempt* to find and click on a chat room in the KakaoTalk interface whose name matches the `chat_name` argument (this name would typically be supplied from the `KAKAOTALK_CHAT_NAME_TO_MONITOR` configuration).
+    *   **Crucially, this uses placeholder/conceptual Playwright selectors.** These selectors **must be replaced by a developer** with actual, working selectors identified from inspecting your KakaoTalk PC client's UI structure. Without this customization, chat selection will fail.
+*   **Message Reading (Conceptual)**:
+    *   The `read_messages()` method attempts to find and extract text, sender, and timestamp from message bubbles within the currently (conceptually) selected chat.
+    *   This also **relies on placeholder/conceptual Playwright selectors** for message elements and their components. These also **must be customized by a developer.**
+    *   Currently, it focuses on visible messages; scrolling to load older messages is not yet implemented.
+
+**In summary: The agent provides a framework for KakaoTalk automation using Playwright, but its core interaction logic (finding chats, reading messages) will only function correctly after a developer inspects their KakaoTalk PC client and replaces the placeholder selectors in `ingestion/agents.py` with actual, working ones.**
 
 ## Future Enhancements (Potential)
 
