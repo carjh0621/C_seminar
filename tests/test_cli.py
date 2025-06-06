@@ -5,20 +5,53 @@ from rich.console import Console
 from datetime import datetime, timedelta
 
 try:
-    from cli.main_cli import app as cli_app
+    from cli.main_cli import app as cli_app, get_status_from_md_marker # Import helper
     from persistence.models import Task, TaskStatus
-    # Assuming datetime is used directly, not just for type hints in models
+    from datetime import datetime, date, time as dt_time # Added date and dt_time
+    from telegram import constants as telegram_constants # For ParseMode, though not directly used in these CLI tests
+    from typing import Any # For dummy Task
 except ModuleNotFoundError as e:
     print(f"CRITICAL in tests/test_cli.py: Could not import CLI app or models for testing: {e}")
     print("Ensure tests are run from project root or PYTHONPATH is correctly set.")
+    # Define dummy app and models if import fails so the test file itself is valid Python
     import typer
     cli_app = typer.Typer()
-    class Task:
-        def __init__(self, **kwargs): setattr(self, 'id', kwargs.get('id', None)) # Basic mock
-    class TaskStatus:
+    class Task: # type: ignore
+        def __init__(self, **kwargs):
+            self.id = kwargs.get('id')
+            self.title = kwargs.get('title')
+            self.due_dt = kwargs.get('due_dt')
+            self.status = kwargs.get('status')
+            self.type = kwargs.get('type')
+            self.body = kwargs.get('body')
+            self.tags = kwargs.get('tags')
+            self.fingerprint = kwargs.get('fingerprint')
+            self.created_dt = kwargs.get('created_dt')
+            self.last_modified_dt = kwargs.get('last_modified_dt')
+    class TaskStatus: # type: ignore
         TODO=MagicMock(name="TODO"); DONE=MagicMock(name="DONE"); CANCELLED=MagicMock(name="CANCELLED")
-        def __getitem__(self, item): return getattr(self, item.upper()) # For TaskStatus[str.upper()]
-    # datetime and timedelta are standard library, should be fine.
+        @classmethod
+        def __getitem__(cls, item): return getattr(cls, item.upper())
+    class datetime: # type: ignore
+        @staticmethod
+        def utcnow(): return MagicMock(spec=datetime)
+        @staticmethod
+        def strptime(s, f): return MagicMock(spec=datetime)
+        def date(self): return MagicMock(spec=date)
+        def time(self): return MagicMock(spec=dt_time)
+        def isoformat(self): return "dummy_iso_string"
+    class date: pass # type: ignore
+    class dt_time: # type: ignore
+        def __init__(self, h=0, m=0, s=0): pass
+    class timedelta: # type: ignore
+        def __init__(self, hours=0):pass
+    class telegram_constants: # type: ignore
+        class ParseMode: MARKDOWN_V2 = "MarkdownV2"
+    def get_status_from_md_marker(status_md: str): # type: ignore
+        if status_md == "[x]": return TaskStatus.DONE
+        if status_md == "[ ]": return TaskStatus.TODO
+        if status_md == "[c]": return TaskStatus.CANCELLED
+        return None
 
 
 runner = CliRunner()
@@ -254,3 +287,117 @@ class TestCliCommands(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestCliSyncCommands(unittest.TestCase):
+
+    def test_get_status_from_md_marker(self):
+        # This test now uses the get_status_from_md_marker imported (or dummied) at the top
+        self.assertEqual(get_status_from_md_marker("[ ]"), TaskStatus.TODO)
+        self.assertEqual(get_status_from_md_marker("[x]"), TaskStatus.DONE)
+        self.assertEqual(get_status_from_md_marker("[X]"), TaskStatus.DONE)
+        self.assertEqual(get_status_from_md_marker("[c]"), TaskStatus.CANCELLED)
+        self.assertEqual(get_status_from_md_marker("[C]"), TaskStatus.CANCELLED)
+        self.assertIsNone(get_status_from_md_marker("[-]"))
+        self.assertIsNone(get_status_from_md_marker(""))
+        self.assertIsNone(get_status_from_md_marker("[?]"))
+
+    @patch('cli.main_cli.os.path.exists')
+    @patch('cli.main_cli.os.path.isfile')
+    @patch('cli.main_cli.parse_markdown_agenda_file')
+    @patch('cli.main_cli.find_matching_task_in_db')
+    @patch('cli.main_cli.crud')
+    @patch('cli.main_cli.SessionLocal')
+    def test_sync_obsidian_dry_run_status_change(
+        self, MockSessionLocal, mock_crud_cli, mock_find_match, mock_parse_md, mock_is_file, mock_path_exists
+    ):
+        mock_path_exists.return_value = True
+        mock_is_file.return_value = True
+
+        mock_db_session = MagicMock()
+        MockSessionLocal.return_value = mock_db_session
+
+        md_tasks = [
+            {"date_str": "2024-01-01", "status_md": "[x]", "time_str": "10:00", "title_md": "MD Task 1 Title", "tags_md": ["#test"]},
+            {"date_str": "2024-01-01", "status_md": "[ ]", "time_str": "11:00", "title_md": "MD Task 2 Title", "tags_md": []},
+        ]
+        mock_parse_md.return_value = md_tasks
+
+        db_task1 = Task(id=1); db_task1.title="MD Task 1 Title"; db_task1.status=TaskStatus.TODO; db_task1.due_dt=datetime(2024,1,1,10,0)
+        db_task2 = Task(id=2); db_task2.title="MD Task 2 Title"; db_task2.status=TaskStatus.TODO; db_task2.due_dt=datetime(2024,1,1,11,0)
+
+        mock_crud_cli.get_tasks.return_value = [db_task1, db_task2]
+
+        def find_match_side_effect(parsed_md_task, db_tasks_on_date_list):
+            self.assertEqual(len(db_tasks_on_date_list), 2)
+            if parsed_md_task["title_md"] == "MD Task 1 Title": return db_task1
+            if parsed_md_task["title_md"] == "MD Task 2 Title": return db_task2
+            return None
+        mock_find_match.side_effect = find_match_side_effect
+
+        result = runner.invoke(cli_app, ["sync", "dummy_path.md", "--dry-run"])
+
+        self.assertEqual(result.exit_code, 0, f"CLI sync command failed: {result.stdout}")
+        mock_parse_md.assert_called_once_with("dummy_path.md")
+
+        mock_crud_cli.get_tasks.assert_called_once()
+        self.assertEqual(mock_find_match.call_count, 2)
+
+        self.assertIn("Detected 1 potential status updates", result.stdout)
+        self.assertIn("MD Task 1 Title", result.stdout)
+        self.assertIn("status", result.stdout)
+        self.assertIn(TaskStatus.TODO.name, result.stdout)
+        self.assertIn(TaskStatus.DONE.name, result.stdout)
+
+        mock_crud_cli.update_task.assert_not_called()
+        mock_crud_cli.update_task_tags.assert_not_called()
+
+    @patch('cli.main_cli.os.path.exists', return_value=True)
+    @patch('cli.main_cli.os.path.isfile', return_value=True)
+    @patch('cli.main_cli.parse_markdown_agenda_file')
+    @patch('cli.main_cli.find_matching_task_in_db')
+    @patch('cli.main_cli.crud')
+    @patch('cli.main_cli.SessionLocal')
+    def test_sync_obsidian_dry_run_no_changes(self, MockSessionLocal, mock_crud_cli, mock_find_match_in_cli, mock_parse_md):
+        mock_db_session = MagicMock(); MockSessionLocal.return_value = mock_db_session
+
+        md_tasks = [{"date_str": "2024-01-01", "status_md": "[ ]", "title_md": "MD Task No Change", "tags_md": []}]
+        mock_parse_md.return_value = md_tasks
+
+        db_task_no_change = Task(id=3); db_task_no_change.title="MD Task No Change";
+        db_task_no_change.status=TaskStatus.TODO; db_task_no_change.due_dt=datetime(2024,1,1,0,0)
+        mock_crud_cli.get_tasks.return_value = [db_task_no_change]
+
+        mock_find_match_in_cli.return_value = db_task_no_change
+
+        result = runner.invoke(cli_app, ["sync", "path.md"])
+
+        self.assertEqual(result.exit_code, 0, f"CLI sync (no changes) failed: {result.stdout}")
+        self.assertIn("No differences found", result.stdout)
+        self.assertNotIn("Detected 0 potential status updates", result.stdout)
+        mock_find_match_in_cli.assert_called_once()
+
+    @patch('cli.main_cli.os.path.exists')
+    @patch('cli.main_cli.os.path.isfile')
+    def test_sync_obsidian_file_not_found(self, mock_is_file, mock_path_exists):
+        mock_path_exists.return_value = False
+        mock_is_file.return_value = False
+
+        result = runner.invoke(cli_app, ["sync", "nonexistent.md"])
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("Error: File not found", result.stdout)
+
+    # Placeholder for testing --no-dry-run when implemented
+    # @patch('cli.main_cli.os.path.exists', return_value=True)
+    # @patch('cli.main_cli.os.path.isfile', return_value=True)
+    # @patch('cli.main_cli.parse_markdown_agenda_file')
+    # @patch('cli.main_cli.find_matching_task_in_db')
+    # @patch('cli.main_cli.crud')
+    # @patch('cli.main_cli.SessionLocal')
+    # @patch('typer.confirm', return_value=True)
+    # def test_sync_obsidian_actual_run_status_update(
+    #     self, mock_typer_confirm, MockSessionLocal, mock_crud_cli,
+    #     mock_find_match, mock_parse_md
+    # ):
+    #     pass
