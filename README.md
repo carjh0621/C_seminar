@@ -64,7 +64,7 @@ python main.py
 This will:
 1.  Perform initial database setup (create tables if they don't exist).
 2.  Initialize and start the scheduler.
-3.  The scheduler is configured by default to run the **Gmail ingestion pipeline daily at 22:00 KST (Korean Standard Time)**.
+3.  The scheduler is configured by default to run the **main ingestion pipelines (currently Gmail and experimental KakaoTalk) daily at 22:00 KST (Korean Standard Time)**.
 
 The application will then run in the foreground, printing log messages from the scheduler and the pipeline jobs to the console.
 
